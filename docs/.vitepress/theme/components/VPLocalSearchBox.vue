@@ -706,16 +706,47 @@ function isSameLocationResult(resultId: string) {
   return targetUrl.pathname === window.location.pathname && targetUrl.hash === window.location.hash
 }
 
-function prepareResultNavigation(result: SearchResult & Result) {
+function prepareResultNavigation(result: SearchResult & Result, resultIndex: number) {
   if (!areSearchHighlightsEnabled.value) return
 
-  queueSearchResultHighlight(result, filterText.value, isFuzzySearch.value)
+  const marks = resultMarks.value.get(resultIndex)
+  const curr = currentMarkIndex.value.get(resultIndex) ?? 0
+  const targetText = marks?.[curr]?.textContent ?? ''
+
+  queueSearchResultHighlight(result, filterText.value, isFuzzySearch.value, curr, targetText)
 
   if (isSameLocationResult(result.id)) {
     window.setTimeout(() => {
       void syncSearchResultHighlightRepeatedly()
     }, 0)
   }
+}
+
+function navigateToResult(result: SearchResult & Result, index: number) {
+  prepareResultNavigation(result, index)
+
+  if (!areSearchHighlightsEnabled.value) {
+    router.go(result.id)
+    close()
+    return
+  }
+
+  const targetUrl = new URL(result.id, window.location.origin)
+  const isSamePage = targetUrl.pathname === window.location.pathname
+
+  if (isSamePage) {
+    if (window.location.hash !== targetUrl.hash) {
+      window.history.pushState(null, '', result.id)
+    }
+    // Manually force DOM sync if the hash is different but page is the same
+    window.setTimeout(() => {
+      void syncSearchResultHighlightRepeatedly()
+    }, 0)
+  } else {
+    router.go(result.id)
+  }
+
+  close()
 }
 
 function toggleSearchHighlights() {
@@ -739,9 +770,7 @@ onKeyStroke('Enter', (e) => {
   }
 
   if (selectedPackage) {
-    prepareResultNavigation(selectedPackage)
-    router.go(selectedPackage.id)
-    close()
+    navigateToResult(selectedPackage, selectedIndex.value)
   }
 })
 
@@ -992,7 +1021,7 @@ function onMouseMove(e: MouseEvent) {
               :aria-label="[...p.titles, p.title].join(' > ')"
               @mouseenter="!disableMouseOver && (selectedIndex = index)"
               @focusin="selectedIndex = index"
-              @click="prepareResultNavigation(p); close()"
+              @click.prevent="navigateToResult(p, index)"
               :data-index="index"
             >
               <div>

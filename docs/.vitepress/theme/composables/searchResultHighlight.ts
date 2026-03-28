@@ -7,6 +7,8 @@ const SEARCH_RESULT_CURRENT_CLASS = 'search-result-highlight-current'
 const SEARCH_RESULT_TARGET_CLASS = 'search-result-highlight-target'
 const SEARCH_RESULT_STALE_MS = 5 * 60 * 1000
 
+let currentSyncId = 0
+
 interface SearchableResult {
   id: string
   match?: Record<string, unknown>
@@ -16,6 +18,8 @@ interface SearchResultHighlightPayload {
   resultId: string
   terms: string[]
   createdAt: number
+  targetIndex?: number
+  targetText?: string
 }
 
 function normalizePath(path: string) {
@@ -122,26 +126,20 @@ function wait(ms = 50) {
   return new Promise((resolve) => window.setTimeout(resolve, ms))
 }
 
-function getScrollOffset() {
+
+
+function scrollElementToCenter(element: HTMLElement) {
+  const rect = element.getBoundingClientRect()
+  const windowHeight = window.innerHeight
   const root = document.documentElement
   const navHeight = Number.parseFloat(getComputedStyle(root).getPropertyValue('--vp-nav-height')) || 64
-  return navHeight + 20
-}
 
-function scrollElementIntoComfortView(element: HTMLElement) {
-  const rect = element.getBoundingClientRect()
-  const offset = getScrollOffset()
-  const viewportHeight = window.innerHeight
-  const topBoundary = offset
-  const bottomBoundary = viewportHeight - 80
+  const safeAreaHeight = windowHeight - navHeight
 
-  if (rect.top >= topBoundary && rect.bottom <= bottomBoundary) {
-    return
-  }
+  const offset = navHeight + (safeAreaHeight / 3) - (rect.height / 2)
 
-  const targetTop = window.scrollY + rect.top - offset
   window.scrollTo({
-    top: Math.max(0, targetTop),
+    top: window.scrollY + rect.top - offset,
     behavior: 'smooth'
   })
 }
@@ -180,7 +178,9 @@ export function formMarkRegex(terms: Iterable<string>) {
 export function queueSearchResultHighlight(
   result: SearchableResult,
   filterText: string,
-  isFuzzySearch: boolean
+  isFuzzySearch: boolean,
+  targetIndex = 0,
+  targetText = ''
 ) {
   if (typeof window === 'undefined') return
 
@@ -189,7 +189,9 @@ export function queueSearchResultHighlight(
   writePayload({
     resultId: result.id,
     terms,
-    createdAt: Date.now()
+    createdAt: Date.now(),
+    targetIndex,
+    targetText
   })
 }
 
@@ -211,7 +213,8 @@ export async function clearSearchResultHighlight() {
 export async function syncSearchResultHighlight(
   maxRetries = 8,
   clearAfterSync = true,
-  shouldScroll = true
+  shouldScroll = true,
+  syncId?: number
 ) {
   if (typeof window === 'undefined' || typeof document === 'undefined') return false
 
@@ -229,6 +232,8 @@ export async function syncSearchResultHighlight(
   }
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
+    if (syncId && syncId !== currentSyncId) return false
+
     const contentRoot = getContentRoot()
 
     if (!contentRoot) {
@@ -238,30 +243,34 @@ export async function syncSearchResultHighlight(
 
     await clearSearchResultHighlight()
 
+    if (syncId && syncId !== currentSyncId) return false
+
     const target = getTargetElement(payload.resultId, contentRoot)
     const sectionScopes = getSectionNodes(contentRoot, target)
     const regex = formMarkRegex(payload.terms)
     const marks: HTMLElement[] = []
+    let headingMatches = 0
 
     if (regex) {
-      await Promise.all(
-        sectionScopes.map(
-          (scope) =>
-            new Promise<void>((resolve) => {
-              new Mark(scope).markRegExp(regex, {
-                acrossElements: true,
-                separateWordSearch: false,
-                className: SEARCH_RESULT_MARK_CLASS,
-                exclude: ['.header-anchor'],
-                each: (node) => {
-                  marks.push(node as HTMLElement)
-                },
-                done: resolve
-              })
-            })
-        )
-      )
+      for (const [index, scope] of sectionScopes.entries()) {
+        if (syncId && syncId !== currentSyncId) return false
+        await new Promise<void>((resolve) => {
+          new Mark(scope).markRegExp(regex, {
+            acrossElements: true,
+            separateWordSearch: false,
+            className: SEARCH_RESULT_MARK_CLASS,
+            exclude: ['.header-anchor'],
+            each: (node) => {
+              marks.push(node as HTMLElement)
+              if (index === 0) headingMatches++
+            },
+            done: resolve
+          })
+        })
+      }
     }
+
+    if (syncId && syncId !== currentSyncId) return false
 
     const targetScopes = dedupeElements(
       marks.map((mark) => getEntryBlock(mark)).filter((scope): scope is HTMLElement => Boolean(scope))
@@ -271,36 +280,76 @@ export async function syncSearchResultHighlight(
       scope.classList.add(SEARCH_RESULT_TARGET_CLASS)
     })
 
-    const activeMark = marks[0]
-    const primaryTarget = targetScopes[0] ?? target
+    let exactMatchFound = false
+    let activeMark = marks[0]
+
+    if (payload.targetText && payload.targetIndex !== undefined) {
+      const adjustedIndex = payload.targetIndex + headingMatches
+      const targetStr = payload.targetText.toLowerCase().trim()
+
+      if (marks.length > adjustedIndex) {
+        const currStr = marks[adjustedIndex].textContent?.toLowerCase().trim()
+        if (currStr === targetStr) {
+          activeMark = marks[adjustedIndex]
+          exactMatchFound = true
+        } else {
+          const textMatch = marks.find(m => m.textContent?.toLowerCase().trim() === targetStr && !sectionScopes[0]?.contains(m))
+          if (textMatch) {
+            activeMark = textMatch
+            exactMatchFound = true
+          } else {
+            activeMark = marks[adjustedIndex]
+            exactMatchFound = true
+          }
+        }
+      } else {
+        const textMatch = marks.find(m => m.textContent?.toLowerCase().trim() === targetStr && !sectionScopes[0]?.contains(m))
+        if (textMatch) {
+          activeMark = textMatch
+        }
+      }
+    } else {
+      exactMatchFound = true
+    }
+
+    const primaryTarget = activeMark ?? targetScopes[0] ?? target
 
     if (activeMark) {
       activeMark.classList.add(SEARCH_RESULT_CURRENT_CLASS)
     }
 
     if (primaryTarget && shouldScroll) {
-      scrollElementIntoComfortView(primaryTarget)
+      scrollElementToCenter(primaryTarget)
     }
 
     if (clearAfterSync) {
       clearPayload()
     }
-    return true
+
+    return exactMatchFound
   }
 
   return false
 }
 
 export async function syncSearchResultHighlightRepeatedly(delays = [0, 120, 350, 800]) {
+  const syncId = ++currentSyncId
   let applied = false
 
   for (const [index, delay] of delays.entries()) {
+    if (syncId !== currentSyncId) return false
+
     if (delay > 0) {
       await wait(delay)
     }
 
+    if (syncId !== currentSyncId) return false
+
     const isLast = index === delays.length - 1
-    const didApply = await syncSearchResultHighlight(8, isLast, !applied)
+    const didApply = await syncSearchResultHighlight(8, isLast, !applied, syncId)
+
+    if (syncId !== currentSyncId) return false
+
     applied = applied || didApply
   }
 
