@@ -4,7 +4,6 @@ const SEARCH_RESULT_HIGHLIGHT_KEY = 'fmhy:search-result-highlight'
 export const SEARCH_HIGHLIGHTS_STORAGE_KEY = 'vitepress:local-search-highlights'
 const SEARCH_RESULT_MARK_CLASS = 'search-result-highlight'
 const SEARCH_RESULT_CURRENT_CLASS = 'search-result-highlight-current'
-const SEARCH_RESULT_TARGET_CLASS = 'search-result-highlight-target'
 const SEARCH_RESULT_STALE_MS = 5 * 60 * 1000
 
 let currentSyncId = 0
@@ -114,13 +113,7 @@ function getSectionNodes(contentRoot: HTMLElement, target: HTMLElement | null) {
   return scopes
 }
 
-function getEntryBlock(element: HTMLElement) {
-  return element.closest('li, tr, p, blockquote, pre, table') as HTMLElement | null
-}
 
-function dedupeElements(elements: Iterable<HTMLElement>) {
-  return [...new Set(elements)]
-}
 
 function wait(ms = 50) {
   return new Promise((resolve) => window.setTimeout(resolve, ms))
@@ -198,9 +191,6 @@ export function queueSearchResultHighlight(
 export async function clearSearchResultHighlight() {
   if (typeof document === 'undefined') return
 
-  document.querySelectorAll(`.${SEARCH_RESULT_TARGET_CLASS}`).forEach((element) => {
-    element.classList.remove(SEARCH_RESULT_TARGET_CLASS)
-  })
 
   const contentRoot = getContentRoot()
   if (!contentRoot) return
@@ -271,15 +261,6 @@ export async function syncSearchResultHighlight(
     }
 
     if (syncId && syncId !== currentSyncId) return false
-
-    const targetScopes = dedupeElements(
-      marks.map((mark) => getEntryBlock(mark)).filter((scope): scope is HTMLElement => Boolean(scope))
-    )
-
-    targetScopes.forEach((scope) => {
-      scope.classList.add(SEARCH_RESULT_TARGET_CLASS)
-    })
-
     let exactMatchFound = false
     let activeMark = marks[0]
 
@@ -312,7 +293,7 @@ export async function syncSearchResultHighlight(
       exactMatchFound = true
     }
 
-    const primaryTarget = activeMark ?? targetScopes[0] ?? target
+    const primaryTarget = activeMark ?? marks[0] ?? target
 
     if (activeMark) {
       activeMark.classList.add(SEARCH_RESULT_CURRENT_CLASS)
