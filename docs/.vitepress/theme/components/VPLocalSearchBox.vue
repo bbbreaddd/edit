@@ -60,10 +60,8 @@ import Tooltip from './Tooltip.vue'
 import FloatingVue from 'floating-vue'
 import { sidebar } from '../../shared'
 import {
-  clearSearchResultHighlight,
   formMarkRegex,
   queueSearchResultHighlight,
-  SEARCH_HIGHLIGHTS_STORAGE_KEY,
   syncSearchResultHighlightRepeatedly
 } from '../composables/searchResultHighlight'
 
@@ -115,7 +113,6 @@ const { localeIndex, theme } = vitePressData
  * Persisted in localStorage for user preference across sessions.
  */
 const isFuzzySearch = useLocalStorage('vitepress:local-search-fuzzy', false)
-const areSearchHighlightsEnabled = useLocalStorage(SEARCH_HIGHLIGHTS_STORAGE_KEY, true)
 
 const searchIndex = computedAsync(async () =>
   markRaw(
@@ -202,8 +199,8 @@ const cache = new LRUCache<string, Map<string, string>>(16)
  * Watches: search index, filter text, detail view toggle, and fuzzy search mode.
  */
 debouncedWatch(
-  () => [searchIndex.value, filterText.value, showDetailedList.value, isFuzzySearch.value, areSearchHighlightsEnabled.value] as const,
-  async ([index, filterTextValue, showDetailedListValue, fuzzySearchValue, highlightsEnabled], old, onCleanup) => {
+  () => [searchIndex.value, filterText.value, showDetailedList.value, isFuzzySearch.value] as const,
+  async ([index, filterTextValue, showDetailedListValue, fuzzySearchValue], old, onCleanup) => {
     if (old?.[0] !== index) {
       // Clear cache on index change (e.g., locale switch or HMR update)
       cache.clear()
@@ -355,7 +352,7 @@ debouncedWatch(
     await new Promise((r) => {
       mark.value?.unmark({
         done: () => {
-          const regex = highlightsEnabled ? formMarkRegex(terms) : null
+          const regex = formMarkRegex(terms)
 
           if (!regex) {
             r(undefined)
@@ -707,8 +704,6 @@ function isSameLocationResult(resultId: string) {
 }
 
 function prepareResultNavigation(result: SearchResult & Result, resultIndex: number) {
-  if (!areSearchHighlightsEnabled.value) return
-
   const marks = resultMarks.value.get(resultIndex)
   const curr = currentMarkIndex.value.get(resultIndex) ?? 0
   const targetText = marks?.[curr]?.textContent ?? ''
@@ -724,12 +719,6 @@ function prepareResultNavigation(result: SearchResult & Result, resultIndex: num
 
 function navigateToResult(result: SearchResult & Result, index: number) {
   prepareResultNavigation(result, index)
-
-  if (!areSearchHighlightsEnabled.value) {
-    router.go(result.id)
-    close()
-    return
-  }
 
   const targetUrl = new URL(result.id, window.location.origin)
   const isSamePage = targetUrl.pathname === window.location.pathname
@@ -747,14 +736,6 @@ function navigateToResult(result: SearchResult & Result, index: number) {
   }
 
   close()
-}
-
-function toggleSearchHighlights() {
-  areSearchHighlightsEnabled.value = !areSearchHighlightsEnabled.value
-
-  if (!areSearchHighlightsEnabled.value) {
-    void clearSearchResultHighlight()
-  }
 }
 
 onKeyStroke('Enter', (e) => {
@@ -969,23 +950,6 @@ function onMouseMove(e: MouseEvent) {
             >
               <span v-if="isFuzzySearch" class="fuzzy-icon">~</span>
               <span v-else class="exact-icon">=</span>
-            </button>
-
-            <button
-              class="toggle-highlight-button"
-              type="button"
-              :class="{ 'highlight-active': areSearchHighlightsEnabled }"
-              :title="areSearchHighlightsEnabled ? 'Disable Highlights' : 'Enable Highlights'"
-              :aria-pressed="areSearchHighlightsEnabled ? 'true' : 'false'"
-              aria-label="Toggle Search Highlights"
-              @click="toggleSearchHighlights"
-            >
-              <span class="highlight-icon">
-                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                  <path d="m9 11-6 6v3h9l3-3"></path>
-                  <path d="m22 12-4.6 4.6a2 2 0 0 1-2.8 0l-5.2-5.2a2 2 0 0 1 0-2.8L14 4"></path>
-                </svg>
-              </span>
             </button>
 
             <button
@@ -1278,8 +1242,7 @@ function onMouseMove(e: MouseEvent) {
   padding: 8px;
 }
 
-.search-actions button:not([disabled]):hover,
-.toggle-layout-button.detailed-list {
+.search-actions button:not([disabled]):hover {
   color: var(--vp-c-brand-1);
 }
 
@@ -1288,8 +1251,7 @@ function onMouseMove(e: MouseEvent) {
 }
 
 /* Custom Feature: Fuzzy search toggle button */
-.toggle-fuzzy-button,
-.toggle-highlight-button {
+.toggle-fuzzy-button {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1302,25 +1264,23 @@ function onMouseMove(e: MouseEvent) {
 }
 
 .toggle-fuzzy-button .fuzzy-icon,
-.toggle-fuzzy-button .exact-icon,
-.toggle-highlight-button .highlight-icon {
+.toggle-fuzzy-button .exact-icon {
   font-size: 18px;
   font-weight: bold;
   line-height: 1;
 }
 
-.toggle-fuzzy-button:hover,
-.toggle-highlight-button:hover {
+.toggle-fuzzy-button:hover {
   background: var(--vp-c-bg-soft);
 }
 
-.toggle-fuzzy-button.fuzzy-active,
-.toggle-highlight-button.highlight-active {
+.toggle-fuzzy-button.fuzzy-active {
   color: var(--vp-c-brand-1);
   background: var(--vp-c-bg-soft);
 }
 
-.toggle-highlight-button:not(.highlight-active) .highlight-icon {
+.toggle-fuzzy-button:not(.fuzzy-active) .fuzzy-icon,
+.toggle-fuzzy-button:not(.fuzzy-active) .exact-icon {
   opacity: 0.45;
 }
 
