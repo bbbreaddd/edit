@@ -1506,4 +1506,11 @@ svg {
 .vp-local-search-leave-active {
   animation: vp-backdrop-enter 0.2s ease-in reverse both;
 }
+
+/* Hide native webkit clear button since there is a custom one in .search-actions */
+.search-input::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+  appearance: none;
+  display: none;
+}
 </style>
