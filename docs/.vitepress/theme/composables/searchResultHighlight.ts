@@ -235,7 +235,14 @@ export async function syncSearchResultHighlight(
 
     if (syncId && syncId !== currentSyncId) return false
 
+    const anchor = getResultAnchor(payload.resultId)
     const target = getTargetElement(payload.resultId, contentRoot)
+    
+    if (anchor && !target) {
+      // The section header hasn't loaded into the DOM yet. Return false to retry later.
+      return false
+    }
+
     const sectionScopes = getSectionNodes(contentRoot, target)
     const regex = formMarkRegex(payload.terms)
     const marks: HTMLElement[] = []
@@ -250,8 +257,8 @@ export async function syncSearchResultHighlight(
             separateWordSearch: false,
             className: SEARCH_RESULT_MARK_CLASS,
             exclude: ['.header-anchor'],
-            each: (node) => {
-              marks.push(node as HTMLElement)
+            each: (node: HTMLElement) => {
+              marks.push(node)
               if (index === 0) headingMatches++
             },
             done: resolve
@@ -280,7 +287,6 @@ export async function syncSearchResultHighlight(
             exactMatchFound = true
           } else {
             activeMark = marks[adjustedIndex]
-            exactMatchFound = true
           }
         }
       } else {
