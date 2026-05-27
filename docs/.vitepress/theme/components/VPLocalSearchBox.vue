@@ -27,7 +27,50 @@ const globalCurrentMarkIndex = ref<Map<number, number>>(new Map())
 const globalResultLimit = ref(RESULTS_PAGE_SIZE)
 const globalUsedSubstringExpansion = ref(false)
 const globalMayHaveMore = ref(false)
-const globalIsAnon = ref(false)
+
+const EyeIcon = () =>
+  h(
+    'svg',
+    {
+      width: '18',
+      height: '18',
+      viewBox: '0 0 24 24',
+      fill: 'none',
+      stroke: 'currentColor',
+      'stroke-width': '2',
+      'stroke-linecap': 'round',
+      'stroke-linejoin': 'round'
+    },
+    [
+      h('path', { d: 'M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z' }),
+      h('circle', { cx: '12', cy: '12', r: '3' })
+    ]
+  )
+
+const EyeOffIcon = () =>
+  h(
+    'svg',
+    {
+      width: '18',
+      height: '18',
+      viewBox: '0 0 24 24',
+      fill: 'none',
+      stroke: 'currentColor',
+      'stroke-width': '2',
+      'stroke-linecap': 'round',
+      'stroke-linejoin': 'round'
+    },
+    [
+      h('path', {
+        d: 'M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94'
+      }),
+      h('path', {
+        d: 'M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19'
+      }),
+      h('line', { x1: '1', y1: '1', x2: '23', y2: '23' }),
+      h('path', { d: 'M14.12 14.12a3 3 0 1 1-4.24-4.24' })
+    ]
+  )
 </script>
 
 <script lang="ts" setup>
@@ -124,7 +167,7 @@ const { localeIndex, theme } = vitePressData
  */
 const isFuzzySearch = useLocalStorage('vitepress:local-search-fuzzy', false)
 
-const isAnon = globalIsAnon
+const isAnon = useLocalStorage('vitepress:local-search-anon', false)
 
 const customMetadata = shallowRef<
   Record<string, { l?: string[]; s?: string[] }>
@@ -1388,11 +1431,13 @@ function addRecentSearch(query: string) {
 }
 
 function removeRecentSearch(query: string) {
+  if (isAnon.value) return
   recentSearches.value = recentSearches.value.filter((s) => s !== query)
   nextTick().then(() => focusSearchInput(false))
 }
 
 function clearAllRecentSearches() {
+  if (isAnon.value) return
   recentSearches.value = []
   nextTick().then(() => focusSearchInput(false))
 }
@@ -1701,54 +1746,6 @@ function fastScrollTo(targetY: number, duration = 150) {
               </button>
 
               <button
-                class="toggle-anon-button"
-                type="button"
-                :class="{ 'anon-active': isAnon }"
-                :aria-pressed="isAnon"
-                :title="
-                  isAnon
-                    ? 'Anon mode active - searches not saved'
-                    : 'Anon mode off - searches will be saved'
-                "
-                @click="isAnon = !isAnon"
-              >
-                <svg
-                  v-if="isAnon"
-                  width="18"
-                  height="18"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                >
-                  <path
-                    d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"
-                  />
-                  <path
-                    d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"
-                  />
-                  <line x1="1" y1="1" x2="23" y2="23" />
-                  <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24" />
-                </svg>
-                <svg
-                  v-else
-                  width="18"
-                  height="18"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                >
-                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
-                  <circle cx="12" cy="12" r="3" />
-                </svg>
-              </button>
-
-              <button
                 class="clear-button"
                 type="reset"
                 :disabled="disableReset"
@@ -1889,62 +1886,61 @@ function fastScrollTo(targetY: number, duration = 150) {
                 </div>
               </li>
               <li
-                v-if="!filterText && recentSearches.length && !isAnon"
-                key="recent-searches"
-                class="recent-searches"
+                v-if="!filterText"
+                key="history-section"
+                class="history-section"
               >
-                <div class="recent-header">
-                  <span class="recent-label">Recent</span>
-                  <button class="clear-all-btn" @click="clearAllRecentSearches">
-                    Clear all
-                  </button>
-                </div>
-                <div class="recent-items">
-                  <div
-                    v-for="s in recentSearches"
-                    :key="s"
-                    class="recent-item-wrapper"
-                  >
-                    <button class="recent-item" @click="applySuggestion(s)">
-                      {{ s }}
-                    </button>
+                <template v-if="!isAnon && recentSearches.length">
+                  <div class="recent-header">
+                    <span class="recent-label">Recent</span>
                     <button
-                      class="recent-delete-btn"
-                      title="Remove search"
-                      @click.stop.prevent="removeRecentSearch(s)"
+                      class="clear-all-btn"
+                      @click="clearAllRecentSearches"
                     >
-                      <span class="vpi-delete delete-icon-mini" />
+                      Clear all
                     </button>
                   </div>
+                  <div class="recent-items">
+                    <div
+                      v-for="s in recentSearches"
+                      :key="s"
+                      class="recent-item-wrapper"
+                    >
+                      <button class="recent-item" @click="applySuggestion(s)">
+                        {{ s }}
+                      </button>
+                      <button
+                        class="recent-delete-btn"
+                        title="Remove search"
+                        @click.stop.prevent="removeRecentSearch(s)"
+                      >
+                        <span class="vpi-delete delete-icon-mini" />
+                      </button>
+                    </div>
+                  </div>
+                </template>
+                <div v-else-if="!isAnon" class="history-empty-placeholder">
+                  No recent searches
                 </div>
-              </li>
-              <li
-                v-else-if="!filterText && isAnon"
-                key="anon-placeholder"
-                class="anon-placeholder"
-              >
-                <svg
-                  width="18"
-                  height="18"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  stroke-width="2"
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                >
-                  <path
-                    d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"
-                  />
-                  <path
-                    d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"
-                  />
-                  <line x1="1" y1="1" x2="23" y2="23" />
-                  <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24" />
-                </svg>
-                <span class="anon-placeholder-text">
-                  Anon mode — searches won't be saved
-                </span>
+                <div v-if="isAnon" class="anon-placeholder">
+                  <EyeOffIcon />
+                  <span class="anon-placeholder-text">
+                    Search history is disabled
+                  </span>
+                </div>
+                <div class="history-toggle-footer">
+                  <button class="history-toggle-btn" @click="isAnon = !isAnon">
+                    <EyeOffIcon v-if="!isAnon" />
+                    <EyeIcon v-else />
+                    <span>
+                      {{
+                        isAnon
+                          ? 'Enable Search History'
+                          : 'Disable Search History'
+                      }}
+                    </span>
+                  </button>
+                </div>
               </li>
               <li
                 v-if="
@@ -2607,10 +2603,6 @@ svg {
   color: var(--vp-c-text-2);
 }
 
-.recent-searches {
-  padding: 8px 12px;
-}
-
 .recent-header {
   display: flex;
   justify-content: space-between;
@@ -2767,33 +2759,46 @@ svg {
   background: var(--vp-c-bg-soft);
 }
 
-/* Anon mode toggle button */
-.toggle-anon-button {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 32px;
-  height: 32px;
-  border-radius: 4px;
-  transition: all 0.2s;
+.history-section {
+  padding: 8px 12px;
 }
 
-.toggle-anon-button:hover {
-  background: var(--vp-c-bg-soft);
-}
-
-.toggle-anon-button.anon-active {
-  color: var(--vp-c-brand-1);
-  background: var(--vp-c-bg-soft);
+.history-empty-placeholder {
+  color: var(--vp-c-text-3);
+  font-size: 0.8rem;
+  padding: 4px 0;
 }
 
 .anon-placeholder {
   display: flex;
   align-items: center;
   gap: 8px;
-  padding: 8px 16px;
+  padding: 4px 0;
   color: var(--vp-c-text-2);
-  font-size: 14px;
+  font-size: 0.8rem;
+}
+
+.history-toggle-footer {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--vp-c-divider);
+}
+
+.history-toggle-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: transparent;
+  border: none;
+  color: var(--vp-c-text-3);
+  font-size: 0.75rem;
+  cursor: pointer;
+  padding: 2px 0;
+  transition: color 0.15s;
+}
+
+.history-toggle-btn:hover {
+  color: var(--vp-c-text-1);
 }
 
 .result-list-enter-active,
