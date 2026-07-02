@@ -5,7 +5,6 @@ import { fileURLToPath } from 'node:url'
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DOCS_DIR = path.resolve(__dirname, '../docs')
 
-// Non-recursive scan of DOCS_DIR
 function getDocsFiles(dir) {
   const files = fs.readdirSync(dir)
   const mdFiles = []
@@ -23,6 +22,67 @@ const args = process.argv.slice(2)
 const files =
   args.length > 0 ? args.map((f) => path.resolve(f)) : getDocsFiles(DOCS_DIR)
 let hasErrors = false
+
+const PLATFORM_ORDER = ['Windows', 'macOS', 'Linux', 'Android', 'iOS', 'Web']
+const PLATFORM_ALIASES = {
+  'All Platforms': 'list the concrete platforms',
+  'Multi-Platform': 'list the concrete platforms',
+  'Multi Platform': 'list the concrete platforms',
+  'Cross-Platform': 'list the concrete platforms'
+}
+function getPlatformErrors(line) {
+  if (!/^\s*[*+-]\s+/.test(line)) return []
+
+  const errors = []
+  const cleanLine = line
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/`[^`]+`/g, '')
+    .replace(/\[[^\]]+\]\([^)]*\)/g, '')
+    .replace(/https?:\/\/[^\s)]+/g, '')
+
+  const parts = cleanLine
+    .split(/\s+(?:\/|-)\s+/)
+    .map((part) => part.replace(/[.!?;:]+$/, '').trim())
+    .filter(Boolean)
+
+  parts.forEach((part) => {
+    for (const [alias, replacement] of Object.entries(PLATFORM_ALIASES)) {
+      if (new RegExp(`\\b${alias}\\b`, 'i').test(part)) {
+        errors.push(
+          `Inconsistent platform wording: "${alias}" (use "${replacement}")`
+        )
+      }
+    }
+
+    const platforms = part.split(/\s*,\s*/)
+    if (
+      platforms.length === 0 ||
+      !platforms.every((platform) =>
+        ['Windows', 'Mac', ...PLATFORM_ORDER].includes(platform)
+      )
+    ) {
+      return
+    }
+
+    if (platforms.includes('Mac')) {
+      errors.push('Inconsistent platform wording: "Mac" (use "macOS")')
+    }
+
+    const normalizedPlatforms = platforms.map((platform) =>
+      platform === 'Mac' ? 'macOS' : platform
+    )
+    const sortedPlatforms = [...normalizedPlatforms].sort(
+      (a, b) => PLATFORM_ORDER.indexOf(a) - PLATFORM_ORDER.indexOf(b)
+    )
+    if (normalizedPlatforms.join(', ') !== sortedPlatforms.join(', ')) {
+      errors.push(
+        `Platforms out of order: "${platforms.join(', ')}" (use "${sortedPlatforms.join(', ')}")`
+      )
+    }
+  })
+
+  return errors
+}
 
 console.log('🔍 Scanning markdown files for formatting issues...\n')
 
@@ -64,10 +124,16 @@ files.forEach((file) => {
     }
     if (inCodeBlock) return
 
+    let errors = []
+
+    // Check 0: Unbalanced inline code ticks
+    if ((line.match(/`/g) || []).length % 2 === 1) {
+      errors.push('Unbalanced inline code ticks')
+    }
+
     if (/^#+\s/.test(line)) {
       currentHeader = line
     }
-    let errors = []
 
     // Check 1: Starred links must be bolded
     // Pattern: * ⭐ [Link] -> Bad
@@ -85,6 +151,21 @@ files.forEach((file) => {
     // Check 2: Space between ] (
     if (/\]\s+\(http/.test(line)) {
       errors.push('Space between bracket and parenthesis in link')
+    }
+
+    // Check 2b: Empty link text
+    if (/\[\s*\]\([^)]*\)/.test(line)) {
+      errors.push('Empty link text')
+    }
+
+    // Check 2c: Empty link URL
+    if (/\[[^\]]+\]\(\s*\)/.test(line)) {
+      errors.push('Empty link URL')
+    }
+
+    // Check 2d: Link URL with leading/trailing spaces
+    if (/\[[^\]]+\]\(\s+[^)]*\)|\[[^\]]+\]\([^)]*\s+\)/.test(line)) {
+      errors.push('Link URL has leading/trailing spaces')
     }
 
     // Check 3: Missing closing bracket ]
@@ -124,6 +205,20 @@ files.forEach((file) => {
     if (trimmedLine.includes('  ')) {
       errors.push('Double space detected')
     }
+
+    // Check 6b: Space before punctuation
+    const punctuationLine = line
+      .replace(/`[^`]+`/g, 'CODE')
+      .replace(/https?:\/\/[^\s)]+/g, 'URL')
+    if (/\s+[,.!?;:](\s|$)/.test(punctuationLine)) {
+      errors.push('Space before punctuation')
+    }
+    if (/(^|[^.])([,.])\s*\2(?!\.)/.test(punctuationLine)) {
+      errors.push('Double punctuation')
+    }
+
+    // Check 6c: Platform wording/order
+    errors.push(...getPlatformErrors(line))
 
     // Check 7: Broken Bold Syntax
     // Pattern: ** Text**, **Text **, or ** Text **
@@ -206,6 +301,7 @@ files.forEach((file) => {
     ]
 
     if (
+      /^\s*[*+-]\s+/.test(line) &&
       !FILES_TO_IGNORE_LINK_SEPARATOR_CHECK.some((ignoredFile) =>
         path.normalize(file).endsWith(path.normalize(ignoredFile))
       )
@@ -282,6 +378,7 @@ files.forEach((file) => {
           'including',
           'includes',
           'that',
+          'this',
           'your',
           'our',
           'of',
@@ -292,6 +389,7 @@ files.forEach((file) => {
           'most',
           'like',
           'every',
+          'any',
           'being',
           'mostly',
           'highly',
@@ -444,6 +542,7 @@ files.forEach((file) => {
       // Remove entire link block: [Text](Url) -> "__LINK__" to avoid merging adjacent words
       const lineCleaned = line
         .replace(/https?:\/\/[^\s)]+/g, '')
+        .replace(/`[^`]+`/g, '__CODE__')
         .replace(/\[[^\]]+\]\([^)]*\)/g, '__LINK__')
 
       // Check 10: Repeated words (e.g. "the the")
@@ -481,6 +580,42 @@ files.forEach((file) => {
         }
       }
 
+      const signUpChecks = [
+        {
+          regex: /(^|[/(-]\s*)(no\s+)?sign up(?=\s*([)/]|\s\/|$))/i,
+          correction: 'Sign-Up'
+        },
+        {
+          regex: /(^|[/(-]\s*)(no\s+)?signup(?=\s*([)/]|\s\/|$))/i,
+          correction: 'Sign-Up'
+        },
+        {
+          regex: /(^|[/(-]\s*)sign-up(?=\s*([)/]|\s\/|$))/i,
+          correction: 'Sign-Up'
+        },
+        {
+          regex: /(^|[/(-]\s*)login required(?=\s*([)/]|\s\/|$))/i,
+          correction: 'Sign-Up'
+        },
+        {
+          regex: /(^|[/(-]\s*)require sign-up(?=\s*([)/]|\s\/|$))/i,
+          correction: 'Requires Sign-Up'
+        },
+        {
+          regex: /(^|[/(-]\s*)required sign-up(?=\s*([)/]|\s\/|$))/i,
+          correction: 'Requires Sign-Up'
+        }
+      ]
+      for (const { regex, correction } of signUpChecks) {
+        const match = lineCleaned.match(regex)
+        const wording = match?.[0].replace(/^[/(-]\s*/, '').trim()
+        if (wording && wording !== correction) {
+          errors.push(
+            `Inconsistent sign-up wording: "${wording}" (use "${correction}")`
+          )
+        }
+      }
+
       // Check 12: Basic A/An Grammar
       const aAnMatch = line.match(/\b(a)\s+([aeio]\w+)/i)
       if (aAnMatch) {
@@ -498,7 +633,7 @@ files.forEach((file) => {
       if (anAMatch) {
         const word = anAMatch[2]
         const isAcronym = /^[A-Z0-9]+$/.test(word)
-        if (!isAcronym) {
+        if (!isAcronym && word.toLowerCase() !== 'nginx') {
           errors.push(
             `Incorrect article "an" usage: "${anAMatch[0]}" (should be "a")`
           )
