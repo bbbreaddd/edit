@@ -41,6 +41,23 @@ export class ThemeHandler {
     }
   }
 
+  // iOS PWA Fix
+  private handleForegroundRecheck = () => {
+    if (
+      typeof document === 'undefined' ||
+      document.visibilityState !== 'visible'
+    )
+      return
+
+    if (!localStorage.getItem(STORAGE_KEY_MODE)) {
+      const prefersDark = window.matchMedia(
+        '(prefers-color-scheme: dark)'
+      ).matches
+      this.state.value.currentMode = prefersDark ? 'dark' : 'light'
+    }
+    this.applyTheme()
+  }
+
   constructor() {
     this.initializeTheme()
   }
@@ -84,6 +101,14 @@ export class ThemeHandler {
     )
     this.prefersDarkMql = window.matchMedia('(prefers-color-scheme: dark)')
     this.prefersDarkMql.addEventListener('change', this.handleSystemThemeChange)
+
+    document.removeEventListener(
+      'visibilitychange',
+      this.handleForegroundRecheck
+    )
+    document.addEventListener('visibilitychange', this.handleForegroundRecheck)
+    window.removeEventListener('pageshow', this.handleForegroundRecheck)
+    window.addEventListener('pageshow', this.handleForegroundRecheck)
   }
 
   /**
@@ -98,6 +123,11 @@ export class ThemeHandler {
       this.handleSystemThemeChange
     )
     this.prefersDarkMql = null
+    document.removeEventListener(
+      'visibilitychange',
+      this.handleForegroundRecheck
+    )
+    window.removeEventListener('pageshow', this.handleForegroundRecheck)
   }
 
   public applyTheme() {
