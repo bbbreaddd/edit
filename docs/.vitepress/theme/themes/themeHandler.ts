@@ -132,6 +132,7 @@ export class ThemeHandler {
             : 'rgba(255, 255, 255, 0.8)'
       root.style.setProperty('--vp-c-bg-elv', bgElvColor)
       this.persistInlineVars()
+      this.forceRepaint()
       return
     }
 
@@ -145,6 +146,12 @@ export class ThemeHandler {
     }
 
     this.persistInlineVars()
+    this.forceRepaint()
+  }
+
+  private forceRepaint() {
+    if (typeof document === 'undefined') return
+    void document.documentElement.offsetHeight
   }
 
   // Snapshot the inline --vp-* CSS variables so the head bootstrap script
