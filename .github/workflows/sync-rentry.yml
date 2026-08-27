@@ -1,0 +1,51 @@
+name: Sync Rentry
+
+on:
+  check_run:
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      write:
+        description: Update Rentry instead of running validation only
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rentry-production-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: >-
+      github.event_name == 'workflow_dispatch' || (github.event.check_run.name
+      == 'Cloudflare Pages' && github.event.check_run.app.slug ==
+      'cloudflare-workers-and-pages' && github.event.check_run.conclusion ==
+      'success' && github.event.check_run.check_suite.head_branch == 'main')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout deployed revision
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.check_run.head_sha || github.sha }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Validate Rentry pages
+        if: github.event_name == 'workflow_dispatch' && !inputs.write
+        run: node scripts/sync-rentry.js
+
+      - name: Sync Rentry pages
+        if: github.event_name == 'check_run' || inputs.write
+        run: node scripts/sync-rentry.js --write
+        env:
+          EXPECTED_DEPLOYMENT_SHA:
+            ${{ github.event.check_run.head_sha || github.sha }}
+          RENTRY_MODIFY_CODE: ${{ secrets.RENTRY_MODIFY_CODE }}

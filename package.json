@@ -12,7 +12,7 @@
     "api:prepare": "nitropack prepare",
     "api:preview": "node .output/server/index.mjs",
     "api:typegen": "wrangler types api/worker-configuration.d.ts",
-    "docs:build": "node scripts/generate-removed.js && node scripts/generate-single-page.js && vitepress build docs/",
+    "docs:build": "node scripts/generate-removed.js && node scripts/generate-single-page.js && node scripts/generate-deployment-marker.js && vitepress build docs/",
     "docs:dev": "node scripts/generate-removed.js && node scripts/generate-single-page.js && vitepress dev docs/",
     "docs:preview": "vitepress preview docs/",
     "format": "lint-staged --config .lintstagedrc.format.json",
@@ -22,7 +22,9 @@
     "lint": "eslint --cache .",
     "lint:md": "node scripts/lint-markdown.js || true",
     "og:dev": "x-satori -t ./docs/.vitepress/hooks/Template.vue -c ./docs/.vitepress/hooks/satoriConfig.ts --dev",
-    "prepare": "simple-git-hooks"
+    "prepare": "simple-git-hooks",
+    "rentry:check": "node scripts/sync-rentry.js",
+    "test:rentry": "node --test scripts/sync-rentry.test.js"
   },
   "simple-git-hooks": {
     "pre-commit": "sh scripts/pre-commit.sh"

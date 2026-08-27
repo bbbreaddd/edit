@@ -1,0 +1,62 @@
+[
+  {
+    "slug": "FMHYAdblock",
+    "source": "docs/privacy.md"
+  },
+  {
+    "slug": "FMHYAI",
+    "source": "docs/ai.md"
+  },
+  {
+    "slug": "FMHYVideo1",
+    "source": "docs/video.md"
+  },
+  {
+    "slug": "FMHYAudio",
+    "source": "docs/audio.md"
+  },
+  {
+    "slug": "FMHYGames",
+    "source": "docs/gaming.md"
+  },
+  {
+    "slug": "FMHYRead",
+    "source": "docs/reading.md"
+  },
+  {
+    "slug": "FMHYDownload",
+    "source": "docs/downloading.md"
+  },
+  {
+    "slug": "FMHYTorrent",
+    "source": "docs/torrenting.md"
+  },
+  {
+    "slug": "it435iha",
+    "source": "docs/educational.md"
+  },
+  {
+    "slug": "FMHYAndroid",
+    "source": "docs/mobile.md"
+  },
+  {
+    "slug": "FMHYLinux",
+    "source": "docs/linux-macos.md"
+  },
+  {
+    "slug": "fmhynon-eng",
+    "source": "docs/non-english.md"
+  },
+  {
+    "slug": "FMHYMisc",
+    "source": "docs/misc.md"
+  },
+  {
+    "slug": "FMHYStorage",
+    "source": "docs/storage.md"
+  },
+  {
+    "slug": "FMHYbackups",
+    "source": "docs/other/backups.md"
+  }
+]
