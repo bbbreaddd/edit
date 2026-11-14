@@ -16,12 +16,12 @@
 
 import type { Theme } from 'vitepress'
 import DefaultTheme from 'vitepress/theme'
-import { loadProgress } from './composables/nprogress'
 import {
-  cancelPendingScroll,
-  pendingScrollQuery,
-  scheduleScrollToMatch
-} from './composables/searchScroll'
+  afterSearchNavigation,
+  beforeSearchNavigation
+} from '../search/resultNavigation'
+import { loadProgress } from './composables/nprogress'
+import { pendingScrollQuery } from './composables/searchScroll'
 import Layout from './Layout.vue'
 import Post from './PostLayout.vue'
 import { useThemeHandler } from './themes/themeHandler'
@@ -140,56 +140,18 @@ export default {
       const originalAfter = router.onAfterRouteChanged
 
       router.onBeforeRouteChange = (to) => {
-        cancelPendingScroll()
-
-        // A search navigation is only the one whose destination matches the
-        // pending query's recorded path. Any other navigation (e.g. a sidebar
-        // link clicked while the search target is still loading) must clear the
-        // stale query so it is never consumed on the wrong page.
-        const normalizePath = (p: string) =>
-          p
-            .replace(/\.html$/, '')
-            .replace(/\/index$/, '')
-            .replace(/\/$/, '')
-            .toLowerCase() || '/'
-
-        let isSearchNav = false
-        const pending = pendingScrollQuery.value
-        if (pending) {
-          try {
-            isSearchNav =
-              normalizePath(new URL(to, window.location.href).pathname) ===
-              normalizePath(
-                new URL(pending.path, window.location.href).pathname
-              )
-          } catch {
-            // If URL parsing fails, assume this is the search nav rather than
-            // dropping the query and silently breaking scroll-to-match.
-            isSearchNav = true
-          }
-        }
-
-        if (!isSearchNav) {
-          pendingScrollQuery.value = null
-        }
+        beforeSearchNavigation(to)
 
         originalBefore?.(to)
       }
 
       router.onAfterRouteChanged = (to) => {
         const hasPendingSearch = !!pendingScrollQuery.value
-
         originalAfter?.(to)
 
         requestAnimationFrame(applySeasonalBranding)
 
-        // Scroll to the exact matching text after a search-result navigation
-        if (hasPendingSearch) {
-          const { query, matchContext } = pendingScrollQuery.value!
-          pendingScrollQuery.value = null
-          const hash = window.location.hash.slice(1)
-          scheduleScrollToMatch(hash, query, 16, matchContext)
-        }
+        afterSearchNavigation(hasPendingSearch)
       }
     }
 
