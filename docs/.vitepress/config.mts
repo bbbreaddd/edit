@@ -20,6 +20,7 @@ import { defs, emojiRender, movePlugin } from './markdown/emoji'
 import { headersPlugin } from './markdown/headers'
 import { localLinksPlugin } from './markdown/localLinks'
 import { toggleStarredPlugin } from './markdown/toggleStarred'
+import { searchIndexHmr } from './search/buildSearchIndex'
 import { transformsPlugin } from './transformer'
 import { replaceNoteLink } from './utils/markdown'
 
@@ -189,6 +190,7 @@ export default defineConfig({
     optimizeDeps: { exclude: ['workbox-window'] },
     plugins: [
       OptimizeExclude(),
+      searchIndexHmr(),
       Terminal({
         console: 'terminal',
         output: ['console', 'terminal']

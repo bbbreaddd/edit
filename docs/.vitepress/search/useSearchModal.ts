@@ -1,6 +1,6 @@
 import type { ModalTranslations } from 'vitepress/types/local-search'
 import type { Ref } from 'vue'
-import type { LocalSearchResult, SearchMetadata, SidebarItem } from './types'
+import type { LocalSearchResult, SidebarItem } from './types'
 import localSearchIndex from '@localSearchIndex'
 import {
   computedAsync,
@@ -60,7 +60,21 @@ const MAX_RECENT_SEARCHES = 20
 const SEARCH_DEBOUNCE_MS = 350
 const MIN_CANDIDATE_POOL = 32
 
+// Keep the latest loaders alive while the modal is closed.
+const searchIndexSource = shallowRef(localSearchIndex)
+if (import.meta.hot) {
+  import.meta.hot.accept('/@localSearchIndex', (module) => {
+    if (module)
+      searchIndexSource.value = module.default as typeof localSearchIndex
+  })
+}
+
 // Persisted results state across mount/unmount of the modal
+let globalLastIndex: {
+  source: typeof searchIndexSource.value
+  locale: string
+} | null = null
+
 const globalLastQuery = ref('')
 const globalLastFuzzy = ref(false)
 const globalLastUrlSearch = ref(false)
@@ -85,17 +99,6 @@ export function useSearchModal() {
   const resultsEl = shallowRef<HTMLElement>()
 
   /* Search */
-
-  const searchIndexData = shallowRef(localSearchIndex)
-
-  // Hot Module Replacement - updates search index without full page reload during development
-  if (import.meta.hot) {
-    import.meta.hot.accept('@localSearchIndex', (m: { default: unknown }) => {
-      if (m) {
-        searchIndexData.value = m.default as typeof localSearchIndex
-      }
-    })
-  }
 
   const vitePressData = useData()
   const { activate } = useFocusTrap(el, {
@@ -205,35 +208,41 @@ export function useSearchModal() {
     el.scrollLeft += event.deltaY
   }
 
-  const customMetadata = shallowRef<SearchMetadata>({})
-
-  const searchIndex = computedAsync(async () => {
-    const rawIndex = (await searchIndexData.value[localeIndex.value]?.())
-      ?.default
-    if (!rawIndex) return null
+  const indexSnapshot = computedAsync(async () => {
+    const source = searchIndexSource.value
+    const locale = localeIndex.value
     const options =
       theme.value.search?.provider === 'local'
         ? theme.value.search.options?.miniSearch
         : undefined
+    const rawIndex = (await source[locale]?.())?.default
+    if (!rawIndex) return null
     const loaded = loadSearchIndex(
       rawIndex,
       options?.options,
       options?.searchOptions
     )
     if (!loaded) return null
-    customMetadata.value = loaded.metadata
-    return markRaw(loaded.index)
+    return markRaw({
+      source,
+      locale,
+      engine: createSearchEngine(
+        loaded.index,
+        loaded.metadata,
+        Array.isArray(sidebar) ? sidebar : []
+      )
+    })
   })
 
-  const engine = computed(() =>
-    searchIndex.value
-      ? createSearchEngine(
-          searchIndex.value,
-          customMetadata.value,
-          Array.isArray(sidebar) ? sidebar : []
-        )
+  // A superseded async load must never supply an index or metadata to this modal.
+  const activeSnapshot = computed(() => {
+    const snapshot = indexSnapshot.value
+    return snapshot?.source === searchIndexSource.value &&
+      snapshot.locale === localeIndex.value
+      ? snapshot
       : null
-  )
+  })
+  let queriedSnapshot: typeof activeSnapshot.value = null
 
   const disableQueryPersistence = computed(() => {
     return (
@@ -287,6 +296,8 @@ export function useSearchModal() {
   function matchesGlobalState() {
     return (
       inBrowser &&
+      globalLastIndex?.source === searchIndexSource.value &&
+      globalLastIndex.locale === localeIndex.value &&
       filterText.value === globalLastQuery.value &&
       isFuzzySearch.value === globalLastFuzzy.value &&
       isUrlSearch.value === globalLastUrlSearch.value &&
@@ -328,10 +339,10 @@ export function useSearchModal() {
   const shouldResetScroll = ref(false)
 
   const autoSuggestions = computed(() => {
-    if (!filterText.value || results.value.length > 0 || !searchIndex.value)
+    if (!filterText.value || results.value.length > 0 || !activeSnapshot.value)
       return []
 
-    return engine.value?.suggest(filterText.value) ?? []
+    return activeSnapshot.value?.engine.suggest(filterText.value) ?? []
   })
 
   watch([filterText, isFuzzySearch, isUrlSearch], () => {
@@ -348,29 +359,52 @@ export function useSearchModal() {
    * Watches: search index, filter text, detail view toggle, and fuzzy search mode.
    */
   watch(
-    [filterText, isFuzzySearch, isUrlSearch, showDetailedList, searchIndex],
+    [filterText, isFuzzySearch, isUrlSearch, showDetailedList, activeSnapshot],
     () => {
       isSearching.value = !matchesGlobalState() && !!filterText.value
     },
     { immediate: true }
   )
 
-  // Rendered excerpts belong to the current locale/index, including during HMR.
-  watch(searchIndex, () => cache.clear(), { immediate: true })
+  // Invalidate restored results immediately, even while a new locale/index loads.
+  watch(
+    [searchIndexSource, localeIndex],
+    () => {
+      cache.clear()
+      allResults.value = []
+      results.value = []
+      resultMarks.value = new Map()
+      currentMarkIndex.value = new Map()
+      categoryCounts.value = new Map()
+      totalResultsCount.value = 0
+      mayHaveMore.value = false
+      activeCategory.value = ''
+      resultLimit.value = RESULTS_PAGE_SIZE
+      enableNoResults.value = false
+      isSearching.value = !!filterText.value
+    },
+    { flush: 'sync' }
+  )
+
+  watch(activeSnapshot, () => cache.clear(), { immediate: true, flush: 'sync' })
 
   // 1. Debounced Search watcher: Only runs the index query and gets the raw matching results list
   watchDebounced(
     () =>
       [
-        searchIndex.value,
+        activeSnapshot.value,
         filterText.value,
         isFuzzySearch.value,
         isUrlSearch.value,
         showDetailedList.value
       ] as const,
-    async ([index, filterTextValue], old, onCleanup) => {
-      const indexChanged = old && old[0] !== undefined && old[0] !== index
-      if (!indexChanged && matchesGlobalState()) {
+    async ([snapshot, filterTextValue], old, onCleanup) => {
+      const snapshotChanged = old && old[0] !== undefined && old[0] !== snapshot
+      if (!snapshotChanged && matchesGlobalState()) {
+        queriedSnapshot = snapshot
+        usedSubstringExpansion.value = globalUsedSubstringExpansion.value
+        allResults.value = globalAllResults.value
+        enableNoResults.value = true
         return
       }
 
@@ -379,7 +413,10 @@ export function useSearchModal() {
         canceled = true
       })
 
-      if (!index || !filterTextValue.trim()) {
+      globalLastIndex = null
+      queriedSnapshot = null
+
+      if (!snapshot || !filterTextValue.trim()) {
         allResults.value = []
         totalResultsCount.value = 0
         mayHaveMore.value = false
@@ -396,7 +433,7 @@ export function useSearchModal() {
       }
 
       const { results: boostedResults, usedSubstringExpansion: expanded } =
-        engine.value!.search(filterTextValue, {
+        snapshot.engine.search(filterTextValue, {
           fuzzy: isFuzzySearch.value,
           urls: isUrlSearch.value
         })
@@ -405,6 +442,7 @@ export function useSearchModal() {
       enableNoResults.value = true
 
       if (canceled) return
+      queriedSnapshot = snapshot
       allResults.value = boostedResults
 
       // Save to global cache (totalResultsCount is set by watcher 2 after excerpt filtering)
@@ -425,10 +463,22 @@ export function useSearchModal() {
         allResults.value,
         resultLimit.value,
         showDetailedList.value,
-        activeCategory.value
+        activeCategory.value,
+        activeSnapshot.value
       ] as const,
     async ([allRes, limit, showDetailedListValue], old, onCleanup) => {
+      const snapshot = activeSnapshot.value
+      const query = globalLastQuery.value
+      const fuzzy = globalLastFuzzy.value
+      const urls = globalLastUrlSearch.value
       let canceled = false
+      const isCanceled = () =>
+        canceled ||
+        allResults.value !== allRes ||
+        activeSnapshot.value !== snapshot ||
+        filterText.value !== query ||
+        isFuzzySearch.value !== fuzzy ||
+        isUrlSearch.value !== urls
       onCleanup(() => {
         canceled = true
       })
@@ -454,20 +504,28 @@ export function useSearchModal() {
         resultMarks.value = new Map()
         currentMarkIndex.value = new Map()
         if (!(old === undefined && filterText.value)) {
-          isSearching.value = false
+          isSearching.value = !!filterText.value && !snapshot
         }
         totalResultsCount.value = 0
         mayHaveMore.value = false
+        if (snapshot && queriedSnapshot === snapshot) {
+          globalResults.value = []
+          globalTotalResultsCount.value = 0
+          globalMayHaveMore.value = false
+          globalLastIndex = { source: snapshot.source, locale: snapshot.locale }
+        }
         if (resultSetChanged) {
           categoryCounts.value = computeCategoryCounts(allRes)
         }
         return
       }
 
+      if (isCanceled()) return
+
       const terms = new Set<string>()
 
       const mapResult = (r: LocalSearchResult, text: string) => {
-        if (isFuzzySearch.value) {
+        if (fuzzy) {
           for (const term of Object.keys(r.match || {})) {
             terms.add(term)
           }
@@ -482,8 +540,7 @@ export function useSearchModal() {
       // Null = the raw pool is what's shown, so chips count from allRes.
       let postFiltered: LocalSearchResult[] | null = null
 
-      const isExactSearch =
-        !isFuzzySearch.value && !usedSubstringExpansion.value
+      const isExactSearch = !fuzzy && !usedSubstringExpansion.value
 
       if (isExactSearch) {
         // Exact mode now runs in both views. We fetch a dynamic candidate pool
@@ -499,17 +556,17 @@ export function useSearchModal() {
         const mods = await Promise.all(
           candidatesToFetch.map((r) => fetchExcerpt(r.id))
         )
-        if (canceled) return
+        if (isCanceled()) return
 
-        await processExcerpts(mods, vitePressData, () => canceled)
-        if (canceled) return
+        await processExcerpts(mods, vitePressData, isCanceled)
+        if (isCanceled()) return
 
         const mapped = candidates.map((r) => {
           const text = lookupExcerptText(r.id)
           return mapResult(r, text)
         })
 
-        const filtered = filterResults(mapped, filterText.value)
+        const filtered = filterResults(mapped, query)
         postFiltered = filtered
         finalResults = filtered.slice(0, limit)
         totalCount = filtered.length
@@ -527,10 +584,10 @@ export function useSearchModal() {
         const mods = await Promise.all(
           slicedToFetch.map((r) => fetchExcerpt(r.id))
         )
-        if (canceled) return
+        if (isCanceled()) return
 
-        await processExcerpts(mods, vitePressData, () => canceled)
-        if (canceled) return
+        await processExcerpts(mods, vitePressData, isCanceled)
+        if (isCanceled()) return
 
         const mapped = sliced.map((r) => {
           const text = showDetailedListValue ? lookupExcerptText(r.id) : ''
@@ -551,8 +608,8 @@ export function useSearchModal() {
         )
       }
 
-      if (!isFuzzySearch.value) {
-        terms.add(filterText.value)
+      if (!fuzzy) {
+        terms.add(query)
       }
 
       results.value = finalResults
@@ -560,7 +617,7 @@ export function useSearchModal() {
       mayHaveMore.value = mayHaveMoreValue
 
       await nextTick()
-      if (canceled) return
+      if (isCanceled()) return
 
       await new Promise<void>((resolve) => {
         if (!resultsEl.value) {
@@ -577,20 +634,17 @@ export function useSearchModal() {
         const m = new Mark(Array.from(targets))
         m.unmark({
           done: () => {
-            m.markRegExp(
-              formMarkRegex(terms, filterText.value, isFuzzySearch.value),
-              {
-                exclude: ['.title-icon'],
-                acrossElements: false,
-                done: () => resolve()
-              }
-            )
+            m.markRegExp(formMarkRegex(terms, query, fuzzy), {
+              exclude: ['.title-icon'],
+              acrossElements: false,
+              done: () => resolve()
+            })
           }
         })
       })
-      if (canceled) return
+      if (isCanceled()) return
 
-      if (isFuzzySearch.value) {
+      if (fuzzy) {
         mergeNearbyMarks(resultsEl.value)
       }
 
@@ -598,7 +652,7 @@ export function useSearchModal() {
       // the query text isn't in the visible link text. Highlight the specific
       // link(s) in the excerpt whose href matched the query.
       if (finalResults.some((r) => r.urlMatched)) {
-        const urlQuery = buildUrlQuery(filterText.value)
+        const urlQuery = buildUrlQuery(query)
         for (const r of finalResults) {
           if (!r.urlMatched || !urlQuery) continue
           const item = resultsEl.value?.querySelector(
@@ -673,7 +727,9 @@ export function useSearchModal() {
 
       isSearching.value = false
 
-      // Save to global cache
+      // Only completed results may be restored after the modal unmounts.
+      if (!snapshot || queriedSnapshot !== snapshot) return
+      globalLastIndex = { source: snapshot.source, locale: snapshot.locale }
       globalResults.value = finalResults
       globalTotalResultsCount.value = totalCount
       globalResultMarks.value = resultMarks.value

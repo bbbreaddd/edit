@@ -14,7 +14,7 @@
  *  limitations under the License.
  */
 
-import type { DefaultTheme } from 'vitepress'
+import type { DefaultTheme, Plugin, SiteConfig } from 'vitepress'
 import type { SearchMetadata } from './types'
 import path from 'node:path'
 import MiniSearch from 'minisearch'
@@ -59,9 +59,12 @@ const globalLinkMetadata: SearchMetadata = {}
 // VitePress controls serialization internally — there's no cleaner hook.
 // If MiniSearch ever drops toJSON, the build will still work; the metadata
 // just won't be attached (and the client already falls back to {}).
+let developmentIndexes: Set<MiniSearch> | undefined
+
 const originalToJSON = MiniSearch.prototype.toJSON
 if (typeof originalToJSON === 'function') {
   MiniSearch.prototype.toJSON = function () {
+    developmentIndexes?.add(this)
     const json = originalToJSON.call(this)
     if (json && typeof json === 'object') {
       ;(json as Record<string, unknown>).customMetadata = globalLinkMetadata
@@ -409,4 +412,81 @@ export const search: DefaultTheme.Config['search'] = {
     detailedView: true
   },
   provider: 'local'
+}
+
+export function searchIndexHmr(): Plugin {
+  return {
+    name: 'fmhy:search-index-hmr',
+    apply: 'serve',
+    configResolved(config) {
+      developmentIndexes = new Set()
+      const site = (
+        config as typeof config & { vitepress: SiteConfig<DefaultTheme.Config> }
+      ).vitepress
+      const localSearch = config.plugins.find(
+        (plugin) => plugin.name === 'vitepress:local-search'
+      )
+      const update = localSearch?.handleHotUpdate
+      if (!localSearch || typeof update !== 'function') {
+        throw new Error(
+          'Search HMR requires the VitePress local-search update hook'
+        )
+      }
+      let pendingUpdate: Promise<unknown> = Promise.resolve()
+      localSearch.handleHotUpdate = function (context) {
+        const updatePage = async () => {
+          if (!context.file.endsWith('.md')) return
+          const page = path
+            .relative(site.srcDir, context.file)
+            .replaceAll('\\', '/')
+          if (!site.pages.includes(page)) return
+          const locale =
+            Object.keys(site.site.locales).find(
+              (key) => key !== 'root' && page.startsWith(`${key}/`)
+            ) ?? 'root'
+          const prefix = '/@localSearchIndex'
+          // Loading registers the actual MiniSearch instance in the serializer above,
+          // including locales that have not been opened in the browser yet.
+          await context.server.pluginContainer.load(prefix + locale)
+          const fileId = path.posix
+            .join(site.site.base, site.rewrites.map[page] ?? page)
+            .replace(/(^|\/)index\.md$/, '$1')
+            .replace(/\.md$/, site.cleanUrls ? '' : '.html')
+          for (const index of developmentIndexes!) {
+            const ids = Object.values(index.toJSON().documentIds).filter(
+              (id: string) => id === fileId || id.startsWith(fileId + '#')
+            )
+            index.discardAll(ids)
+          }
+          // VitePress 1.6 joins the input to srcDir and appends sections without
+          // replacing them. Clear the old IDs above and supply a relative path.
+          await update.call(this, { ...context, file: page })
+          const registry = context.server.moduleGraph.getModuleById(prefix)
+          if (!registry) return
+          for (const module of context.server.moduleGraph.idToModuleMap.values()) {
+            if (module.id?.startsWith(prefix)) {
+              context.server.moduleGraph.invalidateModule(
+                module,
+                new Set(),
+                context.timestamp,
+                true
+              )
+            }
+          }
+          return [...context.modules, registry]
+        }
+        // Serialize edits so an older render cannot overwrite a newer index/metadata.
+        const result = pendingUpdate.then(updatePage, updatePage)
+        pendingUpdate = result
+        return result
+      }
+    },
+    configureServer(server) {
+      const indexes = developmentIndexes
+      server.httpServer?.once('close', () => {
+        indexes?.clear()
+        if (developmentIndexes === indexes) developmentIndexes = undefined
+      })
+    }
+  }
 }
