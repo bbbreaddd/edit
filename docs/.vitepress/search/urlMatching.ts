@@ -178,15 +178,18 @@ export function buildUrlQuery(query: string): UrlQuery | null {
   }
 }
 
-export function looksLikeUrlQuery(query: string) {
+export function isExplicitUrlQuery(query: string) {
+  if (/\s/.test(query.trim())) return false
   const normalized = normalizeUrlSearchValue(query)
-  const stripped = stripSchemeAndWww(normalized)
-  const isSingleToken = !/\s/.test(query.trim())
   return (
-    /^[a-z][a-z0-9+.-]*:\/\//.test(normalized) ||
-    normalized.startsWith('www.') ||
-    (isSingleToken && stripped.includes('.')) ||
-    (isSingleToken && stripped.includes('/'))
+    /^[a-z][a-z0-9+.-]*:\/\//.test(normalized) || normalized.startsWith('www.')
+  )
+}
+
+export function looksLikeUrlQuery(query: string) {
+  return (
+    isExplicitUrlQuery(query) ||
+    (!/\s/.test(query.trim()) && normalizeUrlSearchValue(query).includes('.'))
   )
 }
 

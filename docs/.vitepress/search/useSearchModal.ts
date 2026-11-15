@@ -45,6 +45,7 @@ import {
 import { createSearchEngine, loadSearchIndex } from './searchEngine'
 import {
   buildUrlQuery,
+  isExplicitUrlQuery,
   looksLikeUrlQuery,
   normalizeUrlSearchValue,
   urlMatchesNormalizedUrl
@@ -1017,7 +1018,11 @@ export function useSearchModal() {
     fuzzyOff: 'Switch to Fuzzy Search',
     urlOn: 'Only search names and text',
     urlOff: 'Search link URLs too',
-    urlAuto: 'URL detected — searching link URLs. Click to keep this on.',
+    get urlAuto() {
+      return isExplicitUrlQuery(filterText.value)
+        ? 'URL detected — searching link URLs. Click to keep this on.'
+        : 'Searching names, text, and link URLs. Click to keep URL matching on.'
+    },
     searching: 'Searching...',
     cycleMatches: 'to cycle matches',
     detailedViewOn: 'Detailed view',

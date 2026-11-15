@@ -12,7 +12,12 @@ import {
   tokenizeIndexLike,
   tokenizeSearchText
 } from './normalization'
-import { buildUrlIndex, findUrlMatches, looksLikeUrlQuery } from './urlMatching'
+import {
+  buildUrlIndex,
+  findUrlMatches,
+  isExplicitUrlQuery,
+  looksLikeUrlQuery
+} from './urlMatching'
 
 const MAX_RESULTS_IN_MEMORY = 200
 const MAX_SUBSTRING_TERMS = 100
@@ -134,13 +139,13 @@ function runSearch(
     fuzzy: options.fuzzy && typeof query === 'string' ? fuzzyTolerance : false
   }
 
-  const queryLooksLikeUrl = looksLikeUrlQuery(filterTextValue)
+  const queryLooksLikeUrl = isExplicitUrlQuery(filterTextValue)
   // Pasted URLs should search URLs only. Running the normal text index too
   // turns URL punctuation into generic terms and leaks unrelated results.
   const rawResults = queryLooksLikeUrl
     ? []
     : (index.search(query, searchOptions) as LocalSearchResult[])
-  const searchUrls = options.urls || queryLooksLikeUrl
+  const searchUrls = options.urls || looksLikeUrlQuery(filterTextValue)
   const urlResults = searchUrls
     ? findUrlMatches(index, filterTextValue, getUrlIndex())
     : []
