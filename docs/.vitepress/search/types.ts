@@ -6,6 +6,7 @@ export interface Result {
   text?: string
   urlMatched?: boolean
   urlMatchedStarred?: boolean
+  urlMatchRank?: number
 }
 
 export interface SidebarItem {

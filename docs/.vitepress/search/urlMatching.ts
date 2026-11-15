@@ -328,7 +328,7 @@ export function findUrlMatches(
   // Sort by relevance before applying the ceilings, so when a cap forces a cut
   // we drop the *least* relevant matches: curated/starred entries first, then
   // by match strength (exact > prefix > substring). Within-cap order doesn't
-  // matter — the merged result set is re-sorted globally by tier/score later.
+  // matter — the merged result set is re-sorted globally by tier, URL strength, and score later.
   const ranked = [...candidates.values()].sort((a, b) => {
     return Number(b.starred) - Number(a.starred) || b.rank - a.rank
   })
@@ -352,7 +352,8 @@ export function findUrlMatches(
       match: {},
       ...storedFields,
       urlMatched: true,
-      urlMatchedStarred: rec.starred
+      urlMatchedStarred: rec.starred,
+      urlMatchRank: rec.rank
     })
     if (matches.length >= MAX_URL_MATCHES_TOTAL) break
   }

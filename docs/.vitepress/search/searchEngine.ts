@@ -152,6 +152,7 @@ function runSearch(
     if (existing) {
       existing.score += result.score
       existing.urlMatched = true
+      existing.urlMatchRank = result.urlMatchRank
       existing.urlMatchedStarred =
         existing.urlMatchedStarred || result.urlMatchedStarred
     } else {
@@ -266,6 +267,8 @@ function runSearch(
       const bv = b[key] ? 1 : 0
       if (av !== bv) return bv - av
     }
+    const urlRankDifference = (b.urlMatchRank ?? 0) - (a.urlMatchRank ?? 0)
+    if (urlRankDifference) return urlRankDifference
     if (b.score !== a.score) return b.score - a.score
     // Deterministic fallback for exact score ties so equal-scored results
     // don't reshuffle between fuzzy/exact modes (or re-renders). Compare by
