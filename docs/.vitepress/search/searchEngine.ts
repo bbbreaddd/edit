@@ -160,21 +160,20 @@ function runSearch(
   }
 
   const sidebarItems = Array.isArray(sidebar) ? sidebar : []
-  const currentResults: LocalSearchResult[] = [...mergedResultsById.values()]
-    .sort((a, b) => b.score - a.score)
-    .slice(0, MAX_RESULTS_IN_MEMORY)
-    .map((r) => {
-      const [id] = r.id.split('#')
-      const cleanPath = '/' + id.replace(/\.html$/, '').replace(/^\//, '')
-      const pageTitle = findPageTitle(sidebarItems, cleanPath)
-      const titles = [...r.titles]
+  const currentResults: LocalSearchResult[] = [
+    ...mergedResultsById.values()
+  ].map((r) => {
+    const [id] = r.id.split('#')
+    const cleanPath = '/' + id.replace(/\.html$/, '').replace(/^\//, '')
+    const pageTitle = findPageTitle(sidebarItems, cleanPath)
+    const titles = [...r.titles]
 
-      if (pageTitle && !titles.includes(pageTitle) && r.title !== pageTitle) {
-        titles.unshift(pageTitle)
-      }
+    if (pageTitle && !titles.includes(pageTitle) && r.title !== pageTitle) {
+      titles.unshift(pageTitle)
+    }
 
-      return { ...r, titles }
-    })
+    return { ...r, titles }
+  })
 
   // Ranking model:
   //   1. starredExact  \u2013 query exactly matches a starred-bold hyperlink
@@ -276,7 +275,10 @@ function runSearch(
     )
   })
 
-  return { results: boostedResults, usedSubstringExpansion }
+  return {
+    results: boostedResults.slice(0, MAX_RESULTS_IN_MEMORY),
+    usedSubstringExpansion
+  }
 }
 
 function suggestSearch(
