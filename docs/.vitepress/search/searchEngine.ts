@@ -837,10 +837,7 @@ function runSearch(
       if (difference) return difference
     }
     // An inherited heading must not lift removals above equally direct active matches.
-    if (
-      a.isRecentlyRemoved !== b.isRecentlyRemoved &&
-      (!directMatches || a.hasDirectWord === b.hasDirectWord)
-    )
+    if (a.isRecentlyRemoved !== b.isRecentlyRemoved)
       return a.isRecentlyRemoved ? 1 : -1
     // Retain exact starred names, then prefer headings over ordinary cross-references.
     if (a.hasStarredExact !== b.hasStarredExact)
@@ -858,9 +855,6 @@ function runSearch(
     }
     const urlRankDifference = (b.urlMatchRank ?? 0) - (a.urlMatchRank ?? 0)
     if (urlRankDifference) return urlRankDifference
-    // Within the same match tier, prefer current recommendations over removals.
-    if (a.isRecentlyRemoved !== b.isRecentlyRemoved)
-      return a.isRecentlyRemoved ? 1 : -1
     if (b.score !== a.score) return b.score - a.score
     // Deterministic fallback for exact score ties so equal-scored results
     // don't reshuffle between fuzzy/exact modes (or re-renders). Compare by
