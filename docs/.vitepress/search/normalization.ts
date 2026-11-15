@@ -76,11 +76,19 @@ export function tokenizeIndexLike(
   })
 }
 
+export function normalizeFuzzyTerm(term: string): string {
+  const lower = term.toLowerCase()
+  return /[-'\u0080-\uffff]/.test(lower)
+    ? lower.normalize('NFD').replace(/\p{M}/gu, '').replace(/[-'’]/g, '')
+    : lower
+}
+
 export function tokenizeSearchText(text: string): string[] {
   // VitePress serializes this function into site data, so it must be self-contained.
+  // Preserve C#/F# as terms; other hashes separate words.
   return text
     .replace(/\u2060|\u200B|\u200C|\u200D|\uFEFF/g, '')
-    .split(/[\n\r #%*,=/:;?[\]{}()&]+/u)
+    .split(/[\n\r %*,=/:;?[\]{}()&]+|(?<!\b[cf])#|#(?=[\p{L}\p{N}_])/iu)
 }
 
 export function processSearchTerm(
