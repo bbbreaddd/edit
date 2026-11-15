@@ -166,7 +166,8 @@ function extractLinkMetadata(html: string) {
     const href = extractHref(match[0])
     const cleanedUrl = isSearchableUrl(href) ? cleanUrl(href) : ''
     if (cleanedUrl) urls.add(cleanedUrl)
-    if (cleanedUrl && isStarred(match.index)) starredUrls.add(cleanedUrl)
+    if (cleanedUrl && isStarred(match.index) && !isAuxiliary(match.index))
+      starredUrls.add(cleanedUrl)
 
     const innerHtml = match[1]
     const cleaned = cleanText(innerHtml)

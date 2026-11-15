@@ -25,11 +25,24 @@ export interface LinkMetadata {
   a?: string[]
 }
 export type SearchMetadata = Record<string, LinkMetadata>
+export interface SearchEntryMatch {
+  heading?: boolean
+  context: string
+  phrases: string[]
+  rank: number
+}
+
 export type LocalSearchResult = SearchResult &
   Result & {
     matchesWithoutTerms?: (
       terms: ReadonlySet<string>,
       includeHeadings?: boolean
     ) => boolean
+    entryMatch?: {
+      groups: string[][]
+      headings?: string[]
+      auxiliary: string[]
+      entries?: SearchEntryMatch[]
+    }
     branchMatches?: Record<string, LocalSearchResult>
   }

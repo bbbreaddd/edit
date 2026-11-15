@@ -1,11 +1,19 @@
+import type { LocalSearchResult } from './types'
+import Mark from 'mark.js/src/vanilla.js'
 import { escapeRegExp } from 'vitepress/dist/client/shared'
 import {
   createPhraseRegex,
+  normalizeSearchText as normalizeExcerptText,
   parseSearchQuery,
   stripSchemeAndWww,
   tokenizeSearchText
 } from './normalization'
-import { isExplicitUrlQuery, normalizeUrlSearchValue } from './urlMatching'
+import {
+  buildUrlQuery,
+  isExplicitUrlQuery,
+  normalizeUrlSearchValue,
+  urlMatchesNormalizedUrl
+} from './urlMatching'
 
 const MARK_MERGE_DISTANCE_PX = 20
 const MARK_SAME_LINE_THRESHOLD_PX = 5
@@ -170,4 +178,144 @@ export function formMarkRegex(
     ].join('|'),
     'giu'
   )
+}
+
+export const SEARCH_ENTRY_SELECTOR = 'li, p, pre, tr, blockquote'
+
+export function getSearchEntryText(entry: Element): string {
+  const own = entry.cloneNode(true) as Element
+  own.querySelectorAll('ul, ol').forEach((list) => list.remove())
+  return own.textContent?.trim() ?? ''
+}
+
+export function preferredEntryMark(
+  marks: HTMLElement[],
+  result: LocalSearchResult
+) {
+  const preferred = result.entryMatch?.entries?.[0]
+  return (
+    (preferred && !preferred.heading
+      ? marks.find((mark) => {
+          const entry = mark.closest(SEARCH_ENTRY_SELECTOR)
+          return (
+            entry &&
+            normalizeExcerptText(getSearchEntryText(entry)) ===
+              normalizeExcerptText(preferred.context)
+          )
+        })
+      : undefined) ?? marks[0]
+  )
+}
+
+export async function highlightSearchResults(
+  resultsEl: HTMLElement | undefined,
+  finalResults: LocalSearchResult[],
+  terms: Set<string>,
+  query: string,
+  fuzzy: boolean,
+  isCanceled: () => boolean
+) {
+  await new Promise<void>((resolve) => {
+    if (!resultsEl) {
+      resolve()
+      return
+    }
+    const targets = resultsEl.querySelectorAll(
+      '.result-item:not(.result-list-leave-active) .titles, .result-item:not(.result-list-leave-active) .excerpt'
+    )
+    if (targets.length === 0) {
+      resolve()
+      return
+    }
+    const m = new Mark(Array.from(targets))
+    m.unmark({
+      done: () => {
+        if (isCanceled()) {
+          resolve()
+          return
+        }
+        const jobs = finalResults.flatMap((result) => {
+          const item = resultsEl?.querySelector(
+            `[data-id="${CSS.escape(result.id)}"]`
+          )
+          if (!item) return []
+          const branches = result.searchBranches ?? [query]
+          return branches.map((branch) => {
+            const match = result.branchMatches?.[branch] ?? result
+            const entries = match.entryMatch?.entries
+            const contexts = new Set(
+              entries
+                ?.filter((entry) => !entry.heading)
+                .map((entry) => normalizeExcerptText(entry.context))
+            )
+            const entryTexts = new WeakMap<Element, string>()
+            const markTerms = entries
+              ? new Set(entries.flatMap((entry) => entry.phrases))
+              : result.searchBranches
+                ? new Set(Object.keys(match.match))
+                : terms
+            const matchesEntry = (element: Element | null) => {
+              if (!entries) return true
+              const title = element?.closest('.titles')
+              if (title)
+                return entries.some(
+                  (entry) =>
+                    entry.heading &&
+                    normalizeExcerptText(title.textContent ?? '').includes(
+                      normalizeExcerptText(entry.context)
+                    )
+                )
+              const entry = element?.closest(SEARCH_ENTRY_SELECTOR)
+              if (!entry) return false
+              let text = entryTexts.get(entry)
+              if (text === undefined) {
+                text = normalizeExcerptText(getSearchEntryText(entry))
+                entryTexts.set(entry, text)
+              }
+              return contexts.has(text)
+            }
+            return new Promise<void>((done) => {
+              new Mark([
+                ...item.querySelectorAll('.titles, .excerpt')
+              ]).markRegExp(formMarkRegex(markTerms, branch, fuzzy), {
+                exclude: ['.title-icon', 'mark'],
+                acrossElements: false,
+                filter: (node: Text) => matchesEntry(node.parentElement),
+                done: () => {
+                  const parsed = parseSearchQuery(branch)
+                  const urlQuery =
+                    !parsed.phrases.length && match.urlMatched
+                      ? buildUrlQuery(parsed.text)
+                      : null
+                  if (!isCanceled() && urlQuery) {
+                    for (const anchor of item.querySelectorAll<HTMLAnchorElement>(
+                      '.excerpt a[href]'
+                    )) {
+                      if (
+                        !matchesEntry(anchor) ||
+                        anchor.querySelector('mark[data-markjs="true"]') ||
+                        !urlMatchesNormalizedUrl(
+                          normalizeUrlSearchValue(
+                            anchor.getAttribute('href') ?? ''
+                          ),
+                          urlQuery
+                        )
+                      )
+                        continue
+                      const mark = document.createElement('mark')
+                      mark.setAttribute('data-markjs', 'true')
+                      mark.append(...anchor.childNodes)
+                      anchor.appendChild(mark)
+                    }
+                  }
+                  done()
+                }
+              })
+            })
+          })
+        })
+        Promise.all(jobs).then(() => resolve())
+      }
+    })
+  })
 }

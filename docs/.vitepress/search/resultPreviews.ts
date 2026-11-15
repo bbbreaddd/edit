@@ -1,14 +1,15 @@
 import type { useData } from 'vitepress/dist/client/theme-default/composables/data'
 import type { Component, Slots } from 'vue'
-import type { LocalSearchResult } from './types'
+import type { LocalSearchResult, SearchEntryMatch } from './types'
 import { dataSymbol } from 'vitepress'
 import { pathToFile } from 'vitepress/dist/client/app/utils'
 import { createApp, h } from 'vue'
 import CriticalBadge from '../theme/components/CriticalBadge.vue'
 import Tooltip from '../theme/components/Tooltip.vue'
+import { SEARCH_ENTRY_SELECTOR } from './matchHighlighting'
 import {
   createPhraseRegex,
-  INVISIBLE_CHARS_RE,
+  normalizeSearchText as normalizeExcerptText,
   normalizeSearchUrl,
   normalizeUrlFilters,
   parseSearchQuery,
@@ -171,17 +172,7 @@ export async function processExcerpts(
   }
 }
 
-const SEARCH_ENTRY_SELECTOR = 'li, p, pre, tr, blockquote'
-
-function normalizeText(text: string) {
-  return text
-    .replace(INVISIBLE_CHARS_RE, '')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .toLowerCase()
-}
-
-function collectSearchBlocks(root: DocumentFragment): string[] {
+function collectSearchBlocks(root: DocumentFragment | Element): string[] {
   const blocks: string[] = []
   let owner: Node | undefined
   let parts: string[] = []
@@ -191,13 +182,13 @@ function collectSearchBlocks(root: DocumentFragment): string[] {
     if (parent?.closest('script, style')) continue
     const block = parent?.closest('p, li, pre, tr, blockquote, div') ?? root
     if (block !== owner) {
-      if (parts.length) blocks.push(normalizeText(parts.join('')))
+      if (parts.length) blocks.push(normalizeExcerptText(parts.join('')))
       parts = []
       owner = block
     }
     parts.push(node.textContent ?? '')
   }
-  if (parts.length) blocks.push(normalizeText(parts.join('')))
+  if (parts.length) blocks.push(normalizeExcerptText(parts.join('')))
   return blocks.filter(Boolean)
 }
 
@@ -236,6 +227,10 @@ export function filterResults(
       if (previous) {
         const combined = mergeSearchMatches(previous.result, result)
         combined.searchBranches = [...previous.result.searchBranches!, branch]
+        combined.branchMatches = {
+          ...previous.result.branchMatches,
+          [branch]: result
+        }
         matches.set(result.id, {
           result: combined,
           excluded: new Set(
@@ -244,7 +239,11 @@ export function filterResults(
         })
       } else
         matches.set(result.id, {
-          result: { ...result, searchBranches: [branch] },
+          result: {
+            ...result,
+            searchBranches: [branch],
+            branchMatches: { [branch]: result }
+          },
           excluded
         })
     }
@@ -286,7 +285,7 @@ function filterQueryResults(
   const hasExclusions = excludedTerms.length > 0 || excludedSites.length > 0
   if (hasExclusions) {
     const patterns = excludedTerms.map((term) =>
-      createPhraseRegex(normalizeText(term))
+      createPhraseRegex(normalizeExcerptText(term))
     )
     const hosts = excludedSites
       .map(createSiteMatcher)
@@ -304,7 +303,7 @@ function filterQueryResults(
         if (!template.content.contains(entry)) continue
         const own = entry.cloneNode(true) as Element
         own.querySelectorAll('ul, ol').forEach((list) => list.remove())
-        const text = normalizeText(own.textContent ?? '')
+        const text = normalizeExcerptText(own.textContent ?? '')
         const excluded =
           patterns.some((pattern) => pattern.test(text)) ||
           [...own.querySelectorAll('a[href]')].some((link) => {
@@ -366,21 +365,184 @@ function filterQueryResults(
     })
   }
   const hasEntryFilters = parsed.sites.length > 0 || urlFilters.length > 0
+  const phrasePatterns = parsed.phrases.map((phrase) =>
+    createPhraseRegex(normalizeExcerptText(phrase))
+  )
+  const linksOf = (entry: Element | DocumentFragment) =>
+    [...entry.querySelectorAll('a[href]')].flatMap((link) => {
+      try {
+        return [new URL(link.getAttribute('href')!, 'https://fmhy.net')]
+      } catch {
+        return []
+      }
+    })
+  const matchesLinkFilters = (links: URL[]) =>
+    parsed.sites.every((site) => {
+      const matchesHost = createSiteMatcher(site)
+      return matchesHost && links.some((link) => matchesHost(link.hostname))
+    }) &&
+    urlFilters.every((filter) =>
+      links.some((link) =>
+        normalizeSearchUrl(normalizeUrlSearchValue(link.href)).includes(filter)
+      )
+    )
+
+  if (results.some((result) => result.entryMatch)) {
+    const template = document.createElement('template')
+    results = results.flatMap((result) => {
+      if (!result.entryMatch) return [result]
+      const html = result.text || lookupExcerpt(result.id)?.html
+      if (!html)
+        return !result.entryMatch.groups.length && allowMissingText
+          ? [result]
+          : []
+      template.innerHTML = html
+      const elements = [
+        ...template.content.querySelectorAll(SEARCH_ENTRY_SELECTOR)
+      ]
+      const entries: SearchEntryMatch[] = []
+      const auxiliary = new Set(result.entryMatch.auxiliary)
+      const urlQuery = result.urlMatched ? buildUrlQuery(query) : null
+      for (const element of elements.length
+        ? elements
+        : [...template.content.children]) {
+        const own = element.cloneNode(true) as Element
+        own.querySelectorAll('ul, ol').forEach((list) => list.remove())
+        const block = collectSearchBlocks(own).find(
+          (block) =>
+            result.entryMatch!.groups.length > 0 &&
+            phrasePatterns.every((pattern) => pattern.test(block)) &&
+            result.entryMatch!.groups.every((forms) =>
+              forms.some((form) => block.includes(normalizeExcerptText(form)))
+            )
+        )
+        const links = linksOf(own)
+        const urlMatched =
+          !!urlQuery &&
+          links.some((link) =>
+            urlMatchesNormalizedUrl(
+              normalizeUrlSearchValue(link.href),
+              urlQuery
+            )
+          )
+        if ((!block && !urlMatched) || !matchesLinkFilters(links)) continue
+        const context = own.textContent?.trim() ?? ''
+        const indexedText = [
+          context,
+          ...[...own.querySelectorAll('[alt]')].map(
+            (icon) => icon.getAttribute('alt') ?? ''
+          )
+        ].join(' ')
+        const present = new Set(tokenizeIndexLike(indexedText, true))
+        if (
+          !urlMatched &&
+          !result.matchesWithoutTerms?.(
+            new Set(result.terms.filter((term) => !present.has(term))),
+            false
+          )
+        )
+          continue
+        const phrases = [
+          ...new Set(
+            result.entryMatch.groups.flatMap((forms) =>
+              forms.filter((form) =>
+                block?.includes(normalizeExcerptText(form))
+              )
+            )
+          )
+        ]
+        const matchesPhrase = (text: string) =>
+          phrases.some((phrase) =>
+            normalizeExcerptText(text).includes(normalizeExcerptText(phrase))
+          )
+        const matchingLinks = [...own.querySelectorAll('a')].filter(
+          (link) =>
+            matchesPhrase(link.textContent ?? '') ||
+            (!!urlQuery &&
+              urlMatchesNormalizedUrl(
+                normalizeUrlSearchValue(link.getAttribute('href') ?? ''),
+                urlQuery
+              ))
+        )
+        const primary = matchingLinks.some(
+          (link) => !auxiliary.has(normalizeExcerptText(link.textContent ?? ''))
+        )
+        const description = own.cloneNode(true) as Element
+        description.querySelectorAll('a').forEach((link) => link.remove())
+        const descriptive = matchesPhrase(description.textContent ?? '')
+        const starred =
+          element.classList.contains('starred') ||
+          element.closest('li')?.classList.contains('starred') ||
+          !!own.querySelector('.starred')
+        // Auxiliary link matches do not inherit the resource's star.
+        const rank = primary || descriptive ? (starred ? 2 : 1) : 0
+        if (
+          !entries.some(
+            (entry) =>
+              normalizeExcerptText(entry.context) ===
+              normalizeExcerptText(context)
+          )
+        )
+          entries.push({ context, phrases, rank })
+      }
+      if (!entries.length && !hasEntryFilters) {
+        for (const heading of result.entryMatch.headings ?? [result.title]) {
+          const text = normalizeExcerptText(heading.replace(/<[^>]*>/g, ' '))
+          if (
+            !phrasePatterns.every((pattern) => pattern.test(text)) ||
+            !result.entryMatch.groups.every((forms) =>
+              forms.some((form) => text.includes(normalizeExcerptText(form)))
+            )
+          )
+            continue
+          const present = new Set(tokenizeIndexLike(text))
+          if (
+            !result.matchesWithoutTerms?.(
+              new Set(result.terms.filter((term) => !present.has(term))),
+              false
+            )
+          )
+            continue
+          entries.push({
+            heading: true,
+            context: heading,
+            phrases: [
+              ...new Set(
+                result.entryMatch.groups.flatMap((forms) =>
+                  forms.filter((form) =>
+                    text.includes(normalizeExcerptText(form))
+                  )
+                )
+              )
+            ],
+            rank: 1
+          })
+          break
+        }
+      }
+      if (!entries.length) return []
+      entries.sort((a, b) => b.rank - a.rank)
+      return [{ ...result, entryMatch: { ...result.entryMatch, entries } }]
+    })
+    if (results.every((result) => result.entryMatch))
+      results.sort(
+        (a, b) =>
+          (b.entryMatch?.entries?.[0]?.rank ?? 0) -
+          (a.entryMatch?.entries?.[0]?.rank ?? 0)
+      )
+  }
   if (!query && !hasEntryFilters)
     return { results: isPhrase ? [] : results, excludedEntries }
   if (fuzzy && !parsed.phrases.length && !hasEntryFilters)
     return { results, excludedEntries }
 
   const template = document.createElement('template')
-  const phrasePatterns = parsed.phrases.map((phrase) =>
-    createPhraseRegex(normalizeText(phrase))
-  )
   const matchesText = (
     text: string,
     result: LocalSearchResult,
     indexedText = text
   ) => {
-    text = normalizeText(text)
+    text = normalizeExcerptText(text)
     if (!phrasePatterns.every((pattern) => pattern.test(text))) return false
     if (!query || isPhrase) return true
     if (fuzzy) {
@@ -394,8 +556,8 @@ function filterQueryResults(
     return parsed.phrases.length
       ? parsed.unquotedText
           .split(/\s+/)
-          .every((word) => text.includes(normalizeText(word)))
-      : text.includes(normalizeText(query))
+          .every((word) => text.includes(normalizeExcerptText(word)))
+      : text.includes(normalizeExcerptText(query))
   }
   const clean = (html: string) => {
     template.innerHTML = html
@@ -417,29 +579,8 @@ function filterQueryResults(
         return (entries.length ? entries : [template.content]).some((entry) => {
           const own = entry.cloneNode(true) as Element | DocumentFragment
           own.querySelectorAll('ul, ol').forEach((list) => list.remove())
-          const links = [...own.querySelectorAll('a[href]')].flatMap((link) => {
-            try {
-              return [new URL(link.getAttribute('href')!, 'https://fmhy.net')]
-            } catch {
-              return []
-            }
-          })
-          if (
-            !parsed.sites.every((site) => {
-              const matchesHost = createSiteMatcher(site)
-              return (
-                matchesHost && links.some((link) => matchesHost(link.hostname))
-              )
-            }) ||
-            !urlFilters.every((filter) =>
-              links.some((link) =>
-                normalizeSearchUrl(normalizeUrlSearchValue(link.href)).includes(
-                  filter
-                )
-              )
-            )
-          )
-            return false
+          const links = linksOf(own)
+          if (!matchesLinkFilters(links)) return false
           const text = own.textContent ?? ''
           // Platform names may be rendered as icons rather than visible text.
           const indexedText = fuzzy

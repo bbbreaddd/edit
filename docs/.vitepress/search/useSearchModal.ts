@@ -12,7 +12,6 @@ import {
   watchDebounced
 } from '@vueuse/core'
 import { useFocusTrap } from '@vueuse/integrations/useFocusTrap'
-import Mark from 'mark.js/src/vanilla.js'
 import { inBrowser, useRouter } from 'vitepress'
 import { useData } from 'vitepress/dist/client/theme-default/composables/data'
 import { createSearchTranslate } from 'vitepress/dist/client/theme-default/support/translation'
@@ -30,10 +29,13 @@ import {
 } from 'vue'
 import { sidebar } from '../shared'
 import {
-  formMarkRegex,
   getRelativeOffsetTop,
+  getSearchEntryText,
   groupMarks,
-  mergeNearbyMarks
+  highlightSearchResults,
+  mergeNearbyMarks,
+  preferredEntryMark,
+  SEARCH_ENTRY_SELECTOR
 } from './matchHighlighting'
 import { INVISIBLE_CHARS_RE, parseSearchQuery } from './normalization'
 import { createSearchNavigation } from './resultNavigation'
@@ -44,13 +46,7 @@ import {
   lookupExcerptText
 } from './resultPreviews'
 import { createSearchEngine, loadSearchIndex } from './searchEngine'
-import {
-  buildUrlQuery,
-  isExplicitUrlQuery,
-  looksLikeUrlQuery,
-  normalizeUrlSearchValue,
-  urlMatchesNormalizedUrl
-} from './urlMatching'
+import { isExplicitUrlQuery, looksLikeUrlQuery } from './urlMatching'
 
 const RESULTS_PAGE_SIZE = 16
 const MAX_RECENT_SEARCHES = 20
@@ -537,6 +533,7 @@ export function useSearchModal() {
         .toLowerCase()
       const needsContentFiltering =
         hasExclusions ||
+        scopedResults.some((result) => !!result.entryMatch?.groups.length) ||
         searchQuery.sites.length > 0 ||
         searchQuery.urls.length > 0 ||
         searchQuery.phrases.length > 0 ||
@@ -553,7 +550,10 @@ export function useSearchModal() {
       const candidates = needsContentFiltering
         ? scopedResults.slice(0, candidateLimit)
         : sliced
-      const includeExcerpts = needsContentFiltering || showDetailedListValue
+      const needsPreviewFiltering =
+        needsContentFiltering ||
+        candidates.some((result) => !!result.entryMatch)
+      const includeExcerpts = needsPreviewFiltering || showDetailedListValue
       const knownMatches = new Set(
         filterResults(candidates, query, false, fuzzy).map(
           (result) => result.id
@@ -561,7 +561,7 @@ export function useSearchModal() {
       )
       const previewCandidates = candidates.filter(
         (result, index) =>
-          (needsContentFiltering && !knownMatches.has(result.id)) ||
+          (needsPreviewFiltering && !knownMatches.has(result.id)) ||
           (showDetailedListValue && index < limit)
       )
       await loadExcerpts(previewCandidates, vitePressData, isCanceled)
@@ -571,7 +571,7 @@ export function useSearchModal() {
         ...result,
         text: includeExcerpts ? lookupExcerptText(result.id) : ''
       }))
-      const filtered = needsContentFiltering
+      const filtered = needsPreviewFiltering
         ? filterResults(mapped, query, true, fuzzy)
         : mapped
       const finalResults = needsContentFiltering
@@ -611,68 +611,18 @@ export function useSearchModal() {
       await nextTick()
       if (isCanceled()) return
 
-      await new Promise<void>((resolve) => {
-        if (!resultsEl.value) {
-          resolve()
-          return
-        }
-        const targets = resultsEl.value.querySelectorAll(
-          '.result-item:not(.result-list-leave-active) .titles, .result-item:not(.result-list-leave-active) .excerpt'
-        )
-        if (targets.length === 0) {
-          resolve()
-          return
-        }
-        const m = new Mark(Array.from(targets))
-        m.unmark({
-          done: () => {
-            m.markRegExp(formMarkRegex(terms, query, fuzzy), {
-              exclude: ['.title-icon'],
-              acrossElements: false,
-              done: () => resolve()
-            })
-          }
-        })
-      })
+      await highlightSearchResults(
+        resultsEl.value,
+        finalResults,
+        terms,
+        query,
+        fuzzy,
+        isCanceled
+      )
       if (isCanceled()) return
 
       if (fuzzy) {
         mergeNearbyMarks(resultsEl.value)
-      }
-
-      // URL matches match on a link's href, which mark.js can't highlight because
-      // the query text isn't in the visible link text. Highlight the specific
-      // link(s) in the excerpt whose href matched the query.
-      if (finalResults.some((r) => r.urlMatched)) {
-        for (const r of finalResults) {
-          if (!r.urlMatched) continue
-          const urlQueries = (r.searchBranches ?? [query])
-            .map((branch) => parseSearchQuery(branch))
-            .filter((branch) => !branch.phrases.length)
-            .map((branch) => buildUrlQuery(branch.text))
-            .filter((value) => value !== null)
-          if (!urlQueries.length) continue
-          const item = resultsEl.value?.querySelector(
-            `[data-id="${CSS.escape(r.id)}"]`
-          )
-          if (!item) continue
-          const anchors =
-            item.querySelectorAll<HTMLAnchorElement>('.excerpt a[href]')
-          for (const anchor of anchors) {
-            const href = anchor.getAttribute('href') ?? ''
-            if (
-              !urlQueries.some((urlQuery) =>
-                urlMatchesNormalizedUrl(normalizeUrlSearchValue(href), urlQuery)
-              )
-            )
-              continue
-            if (anchor.querySelector('mark[data-markjs="true"]')) continue
-            const mark = document.createElement('mark')
-            mark.setAttribute('data-markjs', 'true')
-            mark.append(...anchor.childNodes)
-            anchor.appendChild(mark)
-          }
-        }
       }
 
       const excerpts = Array.from(
@@ -682,9 +632,14 @@ export function useSearchModal() {
       ) as HTMLElement[]
       const scrollTargets: { excerpt: HTMLElement; scrollTop: number }[] = []
       for (const excerpt of excerpts) {
-        const markElement = excerpt.querySelector(
-          'mark[data-markjs="true"]'
-        ) as HTMLElement | null
+        const id = excerpt.closest<HTMLElement>('.result-item')?.dataset.id
+        const result = finalResults.find((result) => result.id === id)
+        const marks = [
+          ...excerpt.querySelectorAll<HTMLElement>('mark[data-markjs="true"]')
+        ]
+        const markElement = result
+          ? preferredEntryMark(marks, result)
+          : marks[0]
         if (markElement) {
           const markRelTop = getRelativeOffsetTop(markElement, excerpt)
           const scrollTop =
@@ -712,8 +667,13 @@ export function useSearchModal() {
           item?.querySelectorAll('.excerpt mark[data-markjs="true"]') ?? []
         ) as HTMLElement[]
         if (marks.length > 0) {
-          newResultMarks.set(index, groupMarks(marks))
-          newCurrentMarkIndex.set(index, 0)
+          const groups = groupMarks(marks)
+          const preferred = preferredEntryMark(marks, r)
+          const current = groups.findIndex(
+            (group) => preferred && group.includes(preferred)
+          )
+          newResultMarks.set(index, groups)
+          newCurrentMarkIndex.set(index, Math.max(0, current))
         }
       })
       resultMarks.value = newResultMarks
@@ -1118,14 +1078,20 @@ export function useSearchModal() {
   function getMatchContext(resultIndex: number): string | null {
     const marks = resultMarks.value.get(resultIndex)
     const curr = currentMarkIndex.value.get(resultIndex) ?? 0
-    if (!marks || !marks[curr] || marks[curr].length === 0) return null
+    const match = results.value[resultIndex]?.entryMatch
+    if (!marks || !marks[curr] || marks[curr].length === 0)
+      return match?.entries?.[0]?.context ?? null
 
     const mark = marks[curr][0]
     // Find the closest content container (same selectors used on the actual page)
-    const container = mark.closest('li, p, td, dd, blockquote')
+    const container = mark.closest(
+      match ? SEARCH_ENTRY_SELECTOR : 'li, p, td, dd, blockquote'
+    )
     if (!container) return null
 
-    return container.textContent?.trim() || null
+    return match
+      ? getSearchEntryText(container)
+      : container.textContent?.trim() || null
   }
 
   function handleResultClick(e: MouseEvent, id: string) {

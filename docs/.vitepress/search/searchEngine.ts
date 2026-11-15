@@ -160,6 +160,11 @@ export function mergeSearchMatches(
   }
   return {
     ...a,
+    entryMatch:
+      (b.entryMatch?.entries?.[0]?.rank ?? -1) >
+      (a.entryMatch?.entries?.[0]?.rank ?? -1)
+        ? b.entryMatch
+        : (a.entryMatch ?? b.entryMatch),
     terms: [...new Set([...a.terms, ...b.terms])],
     queryTerms: [...new Set([...a.queryTerms, ...b.queryTerms])],
     match,
@@ -283,6 +288,7 @@ function runSearch(
   let query: Query = filterTextValue
 
   const recoveredTerms = new Map<string, string[]>()
+  const entryPhraseGroups: string[][] = []
   const canRecoverTerms = fuzzy && !looksLikeUrlQuery(filterTextValue)
   if (fuzzy) {
     const parts = filterTextValue.split(/\s+/).filter((p) => p)
@@ -299,6 +305,7 @@ function runSearch(
                   : undefined
               const alternatives = lookup?.alternatives(part) ?? []
               const compounds = lookup?.compounds(part) ?? []
+              if (compounds.length) entryPhraseGroups.push([part, ...compounds])
               if (!alternatives.length && !compounds.length) return part
               const queries: Query[] = [
                 { queries: [part], fuzzy: fuzzyTolerance }
@@ -387,7 +394,8 @@ function runSearch(
       parsed.excludedSites.length ||
       sites.length ||
       urls.length ||
-      parsed.phrases.length)
+      parsed.phrases.length ||
+      entryPhraseGroups.length)
       ? createRemainingMatcher(query, searchOptions)
       : undefined
   const queryLooksLikeUrl = !isPhrase && isExplicitUrlQuery(filterTextValue)
@@ -492,15 +500,10 @@ function runSearch(
       ? [...new Set(tokenizeIndexLike(q))]
       : []
 
-  const compoundLinkTerms =
-    fuzzy && !/\s/.test(q)
-      ? getTermLookup()
-          .compounds(q)
-          .map((phrase) => tokenizeIndexLike(phrase))
-      : []
-  const compoundKey = compoundLinkTerms.length ? normalizeFuzzyTerm(q) : ''
-  const linkTermGroups =
-    requiredLinkTerms.length > 1 ? [requiredLinkTerms] : compoundLinkTerms
+  const matchingPhrases =
+    entryPhraseGroups.length === 1 && !/\s/.test(q)
+      ? entryPhraseGroups[0]
+      : undefined
 
   const singleTerms =
     !options.urls && !isPhrase && !/\s/.test(q) && !looksLikeUrlQuery(q)
@@ -566,18 +569,16 @@ function runSearch(
             tokens = new Set(tokenizeIndexLike(phrase, true))
             phraseTokens.set(phrase, tokens)
           }
-          const words = linkTermGroups.length ? [...tokens] : []
-          const matches = linkTermGroups.length
-            ? (compoundLinkTerms.length > 0 &&
-                words.some((word) =>
-                  normalizeFuzzyTerm(word).includes(compoundKey)
-                )) ||
-              linkTermGroups.some((parts) =>
-                parts.every((part) =>
-                  words.some((word) => word.startsWith(part))
-                )
+          const words = requiredLinkTerms.length > 1 ? [...tokens] : []
+          const matches = matchingPhrases
+            ? matchingPhrases.some((form) =>
+                phrase.includes(form.toLowerCase())
               )
-            : lowerTerms.some((term) => tokens.has(term))
+            : requiredLinkTerms.length > 1
+              ? requiredLinkTerms.every((term) =>
+                  words.some((word) => word.startsWith(term))
+                )
+              : lowerTerms.some((term) => tokens.has(term))
           if (matches) {
             if (auxiliary) hasAuxiliaryWord = true
             else if (isStarred) hasStarredWord = true
@@ -598,19 +599,27 @@ function runSearch(
     const hasStarredUrl = !!r.urlMatchedStarred
     const hasLinkUrl = !!r.urlMatched && !hasStarredUrl
 
+    const indexedTitles =
+      (index.getStoredFields(r.id) as Result | undefined)?.titles ?? []
     const hasHeadingMatch =
       !!headingPattern &&
       // Sidebar labels are display context; use the indexed heading hierarchy.
-      [
-        r.title,
-        ...((index.getStoredFields(r.id) as Result | undefined)?.titles ?? [])
-      ].some((title) => headingPattern.test(title))
+      [r.title, ...indexedTitles].some((title) => headingPattern.test(title))
     const hasDirectWord =
       !!directMatches?.has(r.id) &&
       !(hasAuxiliaryWord && !hasStarredWord && !hasLinkWord && !hasHeadingMatch)
 
     return {
       ...r,
+      entryMatch:
+        entryPhraseGroups.length ||
+        (q && r.urlMatched && !Object.keys(r.match).length)
+          ? {
+              groups: entryPhraseGroups,
+              headings: [r.title, ...indexedTitles],
+              auxiliary: meta?.a ?? []
+            }
+          : undefined,
       matchesWithoutTerms:
         matchesWithoutTerms && Object.keys(r.match).length
           ? (removed: ReadonlySet<string>, includeHeadings?: boolean) =>

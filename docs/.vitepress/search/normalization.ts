@@ -1,5 +1,13 @@
 export const INVISIBLE_CHARS_RE = /\u2060|\u200B|\u200C|\u200D|\uFEFF/g
 
+export function normalizeSearchText(text: string) {
+  return text
+    .replace(INVISIBLE_CHARS_RE, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+}
+
 export function parseSearchQuery(value: string) {
   const tokens = value.match(/[^\s"“]*(?:"[^"\n]*"|“[^”\n]*”)|\S+/g) ?? []
   const sites: string[] = []
