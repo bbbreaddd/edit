@@ -152,3 +152,9 @@ export function normalizeSearchUrl(value: string) {
   const query = params.toString()
   return `${hostPath}${query ? `?${query}` : ''}${hash ? `#${hash}` : ''}`
 }
+
+// Empty normalized operands must not turn URL substring filters into wildcards.
+export function normalizeUrlFilters(values: string[]): string[] | null {
+  const filters = values.map((value) => normalizeSearchUrl(value.toLowerCase()))
+  return filters.some((filter) => !filter) ? null : filters
+}

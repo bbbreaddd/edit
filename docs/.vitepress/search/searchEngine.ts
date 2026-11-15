@@ -11,8 +11,9 @@ import {
   createPhraseRegex,
   INVISIBLE_CHARS_RE,
   normalizeFuzzyTerm,
-  normalizeSearchUrl,
+  normalizeUrlFilters,
   parseSearchQuery,
+  processSearchTerm,
   tokenizeIndexLike,
   tokenizeSearchText
 } from './normalization'
@@ -124,6 +125,55 @@ function createTermLookup(terms: string[]) {
   }
 }
 
+export function mergeSearchMatches(
+  a: LocalSearchResult,
+  b: LocalSearchResult
+): LocalSearchResult {
+  const match = { ...a.match }
+  for (const [term, fields] of Object.entries(b.match)) {
+    match[term] = [...new Set([...(match[term] ?? []), ...fields])]
+  }
+  return {
+    ...a,
+    terms: [...new Set([...a.terms, ...b.terms])],
+    queryTerms: [...new Set([...a.queryTerms, ...b.queryTerms])],
+    match,
+    urlMatched: a.urlMatched || b.urlMatched,
+    urlMatchedStarred: a.urlMatchedStarred || b.urlMatchedStarred,
+    urlMatchRank: Math.max(a.urlMatchRank ?? 0, b.urlMatchRank ?? 0),
+    substringMatched: a.substringMatched || b.substringMatched
+  }
+}
+
+function createRemainingMatcher(query: Query, options: SearchOptions) {
+  let validator: MiniSearch<{ id: number; text: string }> | undefined
+  return (result: LocalSearchResult, removed: ReadonlySet<string>) => {
+    const terms = result.terms.filter(
+      (term) =>
+        !removed.has(term) ||
+        result.match[term]?.some((field) => field !== 'text')
+    )
+    if (terms.length === result.terms.length) return true
+    if (!terms.length) return false
+    // Recheck only the surviving indexed matches, using the original query tree.
+    validator ??= new MiniSearch({
+      fields: ['text'],
+      tokenize: (text) => text.split(' '),
+      processTerm: (term) => term,
+      searchOptions: { prefix: true }
+    })
+    validator.removeAll()
+    validator.add({ id: 0, text: terms.join(' ') })
+    return (
+      validator.search(query, {
+        ...options,
+        tokenize: tokenizeSearchText,
+        processTerm: processSearchTerm
+      }).length > 0
+    )
+  }
+}
+
 function runSearch(
   index: MiniSearch<Result>,
   metadata: SearchMetadata,
@@ -162,8 +212,21 @@ function runSearch(
         const result = results[rank]
         if (!result) continue
         const previous = merged.get(result.id)
-        if (previous) previous.searchBranches!.push(branches[i])
-        else merged.set(result.id, { ...result, searchBranches: [branches[i]] })
+        if (previous) {
+          const combined = mergeSearchMatches(previous, result)
+          combined.searchBranches = [...previous.searchBranches!, branches[i]]
+          combined.branchMatches = {
+            ...previous.branchMatches,
+            [branches[i]]: result
+          }
+          merged.set(result.id, combined)
+        } else {
+          merged.set(result.id, {
+            ...result,
+            searchBranches: [branches[i]],
+            branchMatches: { [branches[i]]: result }
+          })
+        }
       }
     }
     return { results: [...merged.values()].slice(0, MAX_RESULTS_IN_MEMORY) }
@@ -183,7 +246,8 @@ function runSearch(
       parsed.excludedSites.length
     )
   const titlePatterns = titles.map((title) => createPhraseRegex(title))
-  const urlFilters = urls.map((url) => normalizeSearchUrl(url.toLowerCase()))
+  const urlFilters = normalizeUrlFilters(urls)
+  if (!urlFilters) return { results: [] }
   const fuzzy = options.fuzzy && !isPhrase
   let substringTerms: Set<string> | undefined
   let query: Query = filterTextValue
@@ -268,6 +332,10 @@ function runSearch(
     ...(isPhrase ? { prefix: false } : {})
   }
 
+  const matchesWithoutTerms =
+    fuzzy && (parsed.excludedTerms.length || parsed.excludedSites.length)
+      ? createRemainingMatcher(query, searchOptions)
+      : undefined
   const queryLooksLikeUrl = !isPhrase && isExplicitUrlQuery(filterTextValue)
   // Pasted URLs should search URLs only. Running the normal text index too
   // turns URL punctuation into generic terms and leaks unrelated results.
@@ -458,6 +526,10 @@ function runSearch(
 
     return {
       ...r,
+      matchesWithoutTerms:
+        matchesWithoutTerms && Object.keys(r.match).length
+          ? (removed: ReadonlySet<string>) => matchesWithoutTerms(r, removed)
+          : undefined,
       hasStarredExact,
       hasExact,
       hasStarredPrefix,

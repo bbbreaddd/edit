@@ -24,4 +24,8 @@ export interface LinkMetadata {
   su?: string[]
 }
 export type SearchMetadata = Record<string, LinkMetadata>
-export type LocalSearchResult = SearchResult & Result
+export type LocalSearchResult = SearchResult &
+  Result & {
+    matchesWithoutTerms?: (terms: ReadonlySet<string>) => boolean
+    branchMatches?: Record<string, LocalSearchResult>
+  }

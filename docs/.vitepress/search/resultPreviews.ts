@@ -10,8 +10,11 @@ import {
   createPhraseRegex,
   INVISIBLE_CHARS_RE,
   normalizeSearchUrl,
-  parseSearchQuery
+  normalizeUrlFilters,
+  parseSearchQuery,
+  tokenizeIndexLike
 } from './normalization'
+import { mergeSearchMatches } from './searchEngine'
 import {
   buildUrlQuery,
   createSiteMatcher,
@@ -168,6 +171,8 @@ export async function processExcerpts(
   }
 }
 
+const SEARCH_ENTRY_SELECTOR = 'li, p, pre, tr, blockquote'
+
 function normalizeText(text: string) {
   return text
     .replace(INVISIBLE_CHARS_RE, '')
@@ -203,31 +208,81 @@ export function filterResults(
   fuzzy = false
 ) {
   const parsed = parseSearchQuery(filterTextValue)
-  const {
-    text: query,
-    isPhrase,
-    excludedTerms,
-    excludedSites,
-    branches
-  } = parsed
-  if (branches.length > 1) {
-    const matches = new Map<string, LocalSearchResult>()
-    for (const branch of branches) {
-      const eligible = results.filter((result) =>
-        result.searchBranches?.includes(branch)
-      )
-      for (const result of filterResults(
-        eligible,
-        branch,
-        allowMissingText,
-        fuzzy
-      )) {
-        if (!matches.has(result.id))
-          matches.set(result.id, { ...result, searchBranches: [branch] })
+  if (parsed.branches.length <= 1)
+    return filterQueryResults(results, parsed, allowMissingText, fuzzy).results
+
+  const matches = new Map<
+    string,
+    { result: LocalSearchResult; excluded: Set<number> }
+  >()
+  for (const branch of parsed.branches) {
+    const eligible = results
+      .filter((result) => result.searchBranches?.includes(branch))
+      .map((result) => ({
+        ...result,
+        ...result.branchMatches?.[branch],
+        text: result.text
+      }))
+    const filtered = filterQueryResults(
+      eligible,
+      parseSearchQuery(branch),
+      allowMissingText,
+      fuzzy
+    )
+    for (const result of filtered.results) {
+      const excluded =
+        filtered.excludedEntries.get(result.id) ?? new Set<number>()
+      const previous = matches.get(result.id)
+      if (previous) {
+        const combined = mergeSearchMatches(previous.result, result)
+        combined.searchBranches = [...previous.result.searchBranches!, branch]
+        matches.set(result.id, {
+          result: combined,
+          excluded: new Set(
+            [...previous.excluded].filter((entry) => excluded.has(entry))
+          )
+        })
+      } else
+        matches.set(result.id, {
+          result: { ...result, searchBranches: [branch] },
+          excluded
+        })
+    }
+  }
+  let template: HTMLTemplateElement | undefined
+  return results.flatMap((original) => {
+    const found = matches.get(original.id)
+    if (!found) return []
+    if (found.result.searchBranches!.length > 1) {
+      const html = original.text || lookupExcerpt(original.id)?.html
+      if (html) {
+        // Restore source order and retain entries allowed by any qualifying branch.
+        if (found.excluded.size) {
+          template ??= document.createElement('template')
+          template.innerHTML = html
+          template.content
+            .querySelectorAll(SEARCH_ENTRY_SELECTOR)
+            .forEach((entry, index) => {
+              if (found.excluded.has(index)) entry.remove()
+            })
+          found.result.text = template.innerHTML
+        } else found.result.text = html
       }
     }
-    return results.flatMap((result) => matches.get(result.id) ?? [])
-  }
+    return [found.result]
+  })
+}
+
+function filterQueryResults(
+  results: LocalSearchResult[],
+  parsed: ReturnType<typeof parseSearchQuery>,
+  allowMissingText: boolean,
+  fuzzy: boolean
+) {
+  const { text: query, isPhrase, excludedTerms, excludedSites } = parsed
+  const excludedEntries = new Map<string, Set<number>>()
+  const urlFilters = normalizeUrlFilters(parsed.urls)
+  if (!urlFilters) return { results: [], excludedEntries }
   const hasExclusions = excludedTerms.length > 0 || excludedSites.length > 0
   if (hasExclusions) {
     const patterns = excludedTerms.map((term) =>
@@ -241,9 +296,11 @@ export function filterResults(
       const html = result.text || lookupExcerpt(result.id)?.html
       if (!html) return []
       template.innerHTML = html
-      for (const entry of template.content.querySelectorAll(
-        'li, p, pre, tr, blockquote'
-      )) {
+      const entries = [
+        ...template.content.querySelectorAll(SEARCH_ENTRY_SELECTOR)
+      ]
+      const removedTerms = new Set<string>()
+      for (const entry of entries) {
         if (!template.content.contains(entry)) continue
         const own = entry.cloneNode(true) as Element
         own.querySelectorAll('ul, ol').forEach((list) => list.remove())
@@ -261,10 +318,26 @@ export function filterResults(
               return false
             }
           })
-        if (excluded) entry.remove()
+        if (excluded) {
+          for (const term of tokenizeIndexLike(entry.textContent ?? '', true))
+            removedTerms.add(term)
+          entry.remove()
+        }
       }
       const blocks = collectSearchBlocks(template.content)
       if (!blocks.length) return []
+      excludedEntries.set(
+        result.id,
+        new Set(
+          entries.flatMap((entry, index) =>
+            template.content.contains(entry) ? [] : [index]
+          )
+        )
+      )
+      const remainingTerms = new Set(tokenizeIndexLike(blocks.join(' '), true))
+      const lostTerms = new Set(
+        [...removedTerms].filter((term) => !remainingTerms.has(term))
+      )
       const links = [...template.content.querySelectorAll('a[href]')].flatMap(
         (link) => {
           try {
@@ -279,10 +352,10 @@ export function filterResults(
           const matchesHost = createSiteMatcher(site)
           return matchesHost && links.some((link) => matchesHost(link.hostname))
         }) ||
-        !parsed.urls.every((url) =>
+        !urlFilters.every((filter) =>
           links.some((link) =>
             normalizeSearchUrl(normalizeUrlSearchValue(link.href)).includes(
-              normalizeSearchUrl(normalizeUrlSearchValue(url))
+              filter
             )
           )
         )
@@ -300,18 +373,14 @@ export function filterResults(
         fuzzy &&
         !isPhrase &&
         query &&
-        ![result.title, ...result.titles, ...blocks].some((text) =>
-          result.terms.some((term) =>
-            normalizeText(text).includes(term.toLowerCase())
-          )
-        )
+        !result.matchesWithoutTerms?.(lostTerms)
       )
         return []
       return [{ ...result, urlMatched, text: template.innerHTML }]
     })
   }
-  if (!query) return isPhrase ? [] : results
-  if (fuzzy && !isPhrase) return results
+  if (!query) return { results: isPhrase ? [] : results, excludedEntries }
+  if (fuzzy && !isPhrase) return { results, excludedEntries }
   const multiword = /\s/.test(query)
   const template =
     multiword || isPhrase ? document.createElement('template') : null
@@ -325,27 +394,30 @@ export function filterResults(
   const matchesPhrase = (text: string) =>
     phrasePattern ? phrasePattern.test(text) : text.includes(phrase)
 
-  return results.filter((result) => {
-    if (
-      !isPhrase &&
-      !multiword &&
-      (result.urlMatched || (!hasExclusions && result.substringMatched))
-    )
-      return true
-    const headings = [result.title, ...result.titles].map(clean)
-    if (headings.some(matchesPhrase)) return true
+  return {
+    results: results.filter((result) => {
+      if (
+        !isPhrase &&
+        !multiword &&
+        (result.urlMatched || (!hasExclusions && result.substringMatched))
+      )
+        return true
+      const headings = [result.title, ...result.titles].map(clean)
+      if (headings.some(matchesPhrase)) return true
 
-    const cached = lookupExcerpt(result.id)
-    const html = result.text || cached?.html
-    if (!html) return allowMissingText
-    if (!template) return clean(html).includes(phrase)
+      const cached = lookupExcerpt(result.id)
+      const html = result.text || cached?.html
+      if (!html) return allowMissingText
+      if (!template) return clean(html).includes(phrase)
 
-    let blocks = cached?.html === html ? cached.blocks : undefined
-    if (!blocks) {
-      template.innerHTML = html
-      blocks = collectSearchBlocks(template.content)
-      if (cached?.html === html) cached.blocks = blocks
-    }
-    return blocks.some(matchesPhrase)
-  })
+      let blocks = cached?.html === html ? cached.blocks : undefined
+      if (!blocks) {
+        template.innerHTML = html
+        blocks = collectSearchBlocks(template.content)
+        if (cached?.html === html) cached.blocks = blocks
+      }
+      return blocks.some(matchesPhrase)
+    }),
+    excludedEntries
+  }
 }

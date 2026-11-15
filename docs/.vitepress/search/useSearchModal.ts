@@ -562,15 +562,10 @@ export function useSearchModal() {
       await loadExcerpts(previewCandidates, vitePressData, isCanceled)
       if (isCanceled()) return
 
-      const mapped = candidates.map((result) => {
-        if (fuzzy) {
-          for (const term of Object.keys(result.match || {})) terms.add(term)
-        }
-        return {
-          ...result,
-          text: includeExcerpts ? lookupExcerptText(result.id) : ''
-        }
-      })
+      const mapped = candidates.map((result) => ({
+        ...result,
+        text: includeExcerpts ? lookupExcerptText(result.id) : ''
+      }))
       const filtered = needsContentFiltering
         ? filterResults(mapped, query, true, fuzzy)
         : mapped
@@ -599,9 +594,10 @@ export function useSearchModal() {
         )
       }
 
-      if (!fuzzy) {
-        terms.add(searchQuery.text)
-      }
+      if (fuzzy) {
+        for (const result of finalResults)
+          for (const term of Object.keys(result.match)) terms.add(term)
+      } else terms.add(searchQuery.text)
 
       results.value = finalResults
       totalResultsCount.value = totalCount
@@ -935,7 +931,7 @@ export function useSearchModal() {
       navigateToResult(
         selectedPackage.id,
         matchCtx,
-        selectedPackage.searchBranches?.[0]
+        getResultQuery(selectedPackage)
       )
     }
   })
@@ -1093,6 +1089,14 @@ export function useSearchModal() {
     nextTick().then(() => focusSearchInput(false))
   }
 
+  function getResultQuery(result: LocalSearchResult) {
+    // A filters-only OR branch has no text to locate on the page.
+    return (
+      result.searchBranches?.find((branch) => parseSearchQuery(branch).text) ??
+      result.searchBranches?.[0]
+    )
+  }
+
   /**
    * Extract the text content of the element containing the currently active
    * match highlight in the search excerpt. This identifies the SPECIFIC item
@@ -1125,7 +1129,7 @@ export function useSearchModal() {
     navigateToResult(
       id,
       matchContext,
-      results.value[index]?.searchBranches?.[0]
+      results.value[index] ? getResultQuery(results.value[index]) : undefined
     )
   }
 
