@@ -192,6 +192,12 @@ function collectSearchBlocks(root: DocumentFragment | Element): string[] {
   return blocks.filter(Boolean)
 }
 
+function collectIconLabels(root: DocumentFragment | Element): string {
+  return [...root.querySelectorAll('[alt]')]
+    .map((icon) => icon.getAttribute('alt') ?? '')
+    .join(' ')
+}
+
 export function filterResults(
   results: LocalSearchResult[],
   filterTextValue: string,
@@ -303,7 +309,9 @@ function filterQueryResults(
         if (!template.content.contains(entry)) continue
         const own = entry.cloneNode(true) as Element
         own.querySelectorAll('ul, ol').forEach((list) => list.remove())
-        const text = normalizeExcerptText(own.textContent ?? '')
+        const text = normalizeExcerptText(
+          [own.textContent ?? '', collectIconLabels(own)].join(' ')
+        )
         const excluded =
           patterns.some((pattern) => pattern.test(text)) ||
           [...own.querySelectorAll('a[href]')].some((link) => {
@@ -318,7 +326,10 @@ function filterQueryResults(
             }
           })
         if (excluded) {
-          for (const term of tokenizeIndexLike(entry.textContent ?? '', true))
+          for (const term of tokenizeIndexLike(
+            [entry.textContent ?? '', collectIconLabels(entry)].join(' '),
+            true
+          ))
             removedTerms.add(term)
           entry.remove()
         }
@@ -333,7 +344,12 @@ function filterQueryResults(
           )
         )
       )
-      const remainingTerms = new Set(tokenizeIndexLike(blocks.join(' '), true))
+      const remainingTerms = new Set(
+        tokenizeIndexLike(
+          [blocks.join(' '), collectIconLabels(template.content)].join(' '),
+          true
+        )
+      )
       const lostTerms = new Set(
         [...removedTerms].filter((term) => !remainingTerms.has(term))
       )
@@ -392,11 +408,15 @@ function filterQueryResults(
     results = results.flatMap((result) => {
       if (!result.entryMatch) return [result]
       const html = result.text || lookupExcerpt(result.id)?.html
-      if (!html)
-        return !result.entryMatch.groups.length && allowMissingText
-          ? [result]
-          : []
-      template.innerHTML = html
+      if (!html) {
+        if (!allowMissingText) return []
+        if (
+          !result.entryMatch.groups.length &&
+          !result.entryMatch.withHeadingContext
+        )
+          return [result]
+      }
+      template.innerHTML = html ?? ''
       const elements = [
         ...template.content.querySelectorAll(SEARCH_ENTRY_SELECTOR)
       ]
@@ -410,7 +430,8 @@ function filterQueryResults(
         own.querySelectorAll('ul, ol').forEach((list) => list.remove())
         const block = collectSearchBlocks(own).find(
           (block) =>
-            result.entryMatch!.groups.length > 0 &&
+            (result.entryMatch!.groups.length > 0 ||
+              result.entryMatch!.withHeadingContext) &&
             phrasePatterns.every((pattern) => pattern.test(block)) &&
             result.entryMatch!.groups.every((forms) =>
               forms.some((form) => block.includes(normalizeExcerptText(form)))
@@ -427,28 +448,32 @@ function filterQueryResults(
           )
         if ((!block && !urlMatched) || !matchesLinkFilters(links)) continue
         const context = own.textContent?.trim() ?? ''
-        const indexedText = [
-          context,
-          ...[...own.querySelectorAll('[alt]')].map(
-            (icon) => icon.getAttribute('alt') ?? ''
-          )
-        ].join(' ')
+        const indexedText = [context, collectIconLabels(own)].join(' ')
         const present = new Set(tokenizeIndexLike(indexedText, true))
+        const ownTerms = new Set(present)
+        if (result.entryMatch.withHeadingContext)
+          for (const heading of result.entryMatch.headings ?? [result.title])
+            for (const term of tokenizeIndexLike(heading, true))
+              present.add(term)
         if (
           !urlMatched &&
-          !result.matchesWithoutTerms?.(
-            new Set(result.terms.filter((term) => !present.has(term))),
-            false
-          )
+          ((result.entryMatch.withHeadingContext &&
+            !result.terms.some((term) => ownTerms.has(term))) ||
+            !result.matchesWithoutTerms?.(
+              new Set(result.terms.filter((term) => !present.has(term))),
+              false
+            ))
         )
           continue
         const phrases = [
           ...new Set(
-            result.entryMatch.groups.flatMap((forms) =>
-              forms.filter((form) =>
-                block?.includes(normalizeExcerptText(form))
-              )
-            )
+            result.entryMatch.withHeadingContext
+              ? result.terms.filter((term) => ownTerms.has(term))
+              : result.entryMatch.groups.flatMap((forms) =>
+                  forms.filter((form) =>
+                    block?.includes(normalizeExcerptText(form))
+                  )
+                )
           )
         ]
         const matchesPhrase = (text: string) =>
@@ -508,11 +533,13 @@ function filterQueryResults(
             context: heading,
             phrases: [
               ...new Set(
-                result.entryMatch.groups.flatMap((forms) =>
-                  forms.filter((form) =>
-                    text.includes(normalizeExcerptText(form))
-                  )
-                )
+                result.entryMatch.withHeadingContext
+                  ? result.terms.filter((term) => present.has(term))
+                  : result.entryMatch.groups.flatMap((forms) =>
+                      forms.filter((form) =>
+                        text.includes(normalizeExcerptText(form))
+                      )
+                    )
               )
             ],
             rank: 1
@@ -524,7 +551,11 @@ function filterQueryResults(
       entries.sort((a, b) => b.rank - a.rank)
       return [{ ...result, entryMatch: { ...result.entryMatch, entries } }]
     })
-    if (results.every((result) => result.entryMatch))
+    if (
+      results.every(
+        (result) => result.entryMatch && !result.entryMatch.withHeadingContext
+      )
+    )
       results.sort(
         (a, b) =>
           (b.entryMatch?.entries?.[0]?.rank ?? 0) -
@@ -584,12 +615,7 @@ function filterQueryResults(
           const text = own.textContent ?? ''
           // Platform names may be rendered as icons rather than visible text.
           const indexedText = fuzzy
-            ? [
-                text,
-                ...[...own.querySelectorAll('[alt]')].map(
-                  (icon) => icon.getAttribute('alt') ?? ''
-                )
-              ].join(' ')
+            ? [text, collectIconLabels(own)].join(' ')
             : text
           return (
             matchesText(text, result, indexedText) ||

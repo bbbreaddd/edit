@@ -40,6 +40,11 @@ interface BoostFlags {
   hasLinkUrl: boolean
 }
 
+interface CachedLinkPhrase {
+  tokens?: Set<string>
+  foldedName?: string
+}
+
 function findPageTitle(items: SidebarItem[], path: string): string | null {
   for (const item of items) {
     if (item.link === path) return item.text ?? null
@@ -84,6 +89,15 @@ function fuzzyTolerance(term: string) {
 
 function createTermLookup(terms: string[], metadata: SearchMetadata) {
   const indexedTerms = new Set(terms)
+  const recognizedPrefixes = new Map<string, boolean>()
+  const recognizes = (term: string) => {
+    if (indexedTerms.has(term)) return true
+    const cached = recognizedPrefixes.get(term)
+    if (cached !== undefined) return cached
+    const found = terms.some((candidate) => candidate.startsWith(term))
+    recognizedPrefixes.set(term, found)
+    return found
+  }
   const aliases = new Map<string, string[]>()
   for (const term of terms) {
     const key = normalizeFuzzyTerm(term)
@@ -93,9 +107,15 @@ function createTermLookup(terms: string[], metadata: SearchMetadata) {
     else aliases.set(key, indexedTerms.has(key) ? [key, term] : [term])
   }
   const compoundPhrases = new Map<string, Set<string>>()
+  const compoundPrefixes = new Map<string, string[]>()
   const resourcePhrases = new Set<string>()
+  const curatedTerms = new Set<string>()
   for (const item of Object.values(metadata)) {
     const auxiliary = new Set(item.a)
+    for (const phrase of item.s ?? [])
+      if (!auxiliary.has(phrase))
+        for (const term of tokenizeIndexLike(phrase, true))
+          curatedTerms.add(term)
     for (const phrase of [...(item.s ?? []), ...(item.l ?? [])])
       if (!auxiliary.has(phrase)) resourcePhrases.add(phrase)
   }
@@ -111,14 +131,64 @@ function createTermLookup(terms: string[], metadata: SearchMetadata) {
       compoundPhrases.set(key, group)
     }
   }
+  const curatedByLength = new Map<
+    number,
+    { term: string; letters: string[] }[]
+  >()
+  for (const term of curatedTerms) {
+    const letters = Array.from(normalizeFuzzyTerm(term))
+    const group = curatedByLength.get(letters.length) ?? []
+    group.push({ term, letters })
+    curatedByLength.set(letters.length, group)
+  }
+  const spellingRecoveries = new Map<string, string[]>()
   return {
     indexedTerms,
+    recognizes,
     aliases,
+    joinedAliases(words: string[]) {
+      // Only unfamiliar splits receive a curated-name alternative.
+      if (
+        words.length !== 2 ||
+        words.every((word) => {
+          const tokens = tokenizeIndexLike(word)
+          return (
+            tokens.length > 0 && tokens.every((term) => indexedTerms.has(term))
+          )
+        })
+      )
+        return []
+      const key = normalizeFuzzyTerm(words.join(''))
+      const candidates =
+        aliases.get(key) ?? (indexedTerms.has(key) ? [key] : [])
+      return candidates.some((term) => curatedTerms.has(term)) ? candidates : []
+    },
     compounds(word: string) {
       const tokens = tokenizeIndexLike(word)
-      return tokens.length === 1
-        ? [...(compoundPhrases.get(normalizeFuzzyTerm(tokens[0])) ?? [])]
-        : []
+      if (tokens.length !== 1) return []
+      const key = normalizeFuzzyTerm(tokens[0])
+      const exact = compoundPhrases.get(key)
+      if (exact) return [...exact]
+      if (key.length < 5 || indexedTerms.has(key) || aliases.has(key)) return []
+      const cached = compoundPrefixes.get(key)
+      if (cached) return cached
+      const matches = new Set<string>()
+      for (const [joined, phrases] of compoundPhrases) {
+        if (!joined.startsWith(key)) continue
+        for (const phrase of phrases) {
+          // Keep the first word complete; only the final word may be a prefix.
+          for (let end = phrase.indexOf(' ') + 4; end < phrase.length; end++) {
+            const prefix = phrase.slice(0, end)
+            if (normalizeFuzzyTerm(prefix.replace(' ', '')) === key) {
+              matches.add(prefix)
+              break
+            }
+          }
+        }
+      }
+      const prefixes = [...matches]
+      compoundPrefixes.set(key, prefixes)
+      return prefixes
     },
     alternatives(word: string) {
       const tokens = tokenizeIndexLike(word)
@@ -130,6 +200,10 @@ function createTermLookup(terms: string[], metadata: SearchMetadata) {
       if (indexedTerms.has(key)) return key === term ? [] : [key]
       const characters = Array.from(term)
       if (characters.length < 5) return []
+      const cached = spellingRecoveries.get(key)
+      if (cached) return cached
+      // A valid literal prefix is not a misspelling.
+      if (recognizes(term)) return []
       const matches = new Set<string>()
       for (let i = 0; i < characters.length - 1; i++) {
         if (
@@ -145,7 +219,27 @@ function createTermLookup(terms: string[], metadata: SearchMetadata) {
           (indexedTerms.has(swappedKey) ? [swappedKey] : []))
           matches.add(candidate)
       }
-      return [...matches]
+      // Prefer a one-letter gap in a curated name over weaker fuzzy guesses.
+      const normalized = Array.from(key)
+      if (!matches.size && normalized.length >= 5)
+        for (const length of [normalized.length - 1, normalized.length + 1])
+          for (const candidate of curatedByLength.get(length) ?? []) {
+            const shorter =
+              length < normalized.length ? candidate.letters : normalized
+            const longer =
+              length < normalized.length ? normalized : candidate.letters
+            let gap = 0
+            while (gap < shorter.length && shorter[gap] === longer[gap]) gap++
+            if (
+              shorter.every(
+                (letter, i) => letter === longer[i + (i >= gap ? 1 : 0)]
+              )
+            )
+              matches.add(candidate.term)
+          }
+      const recovered = [...matches]
+      spellingRecoveries.set(key, recovered)
+      return recovered
     }
   }
 }
@@ -216,7 +310,7 @@ function runSearch(
   filterTextValue: string,
   options: { fuzzy: boolean; urls: boolean },
   sidebar: SidebarItem[],
-  phraseTokens: Map<string, Set<string>>,
+  phraseCache: Map<string, CachedLinkPhrase>,
   getUrlIndex: () => UrlRecord[],
   getTermLookup: () => ReturnType<typeof createTermLookup>
 ) {
@@ -232,7 +326,7 @@ function runSearch(
           branch,
           options,
           sidebar,
-          phraseTokens,
+          phraseCache,
           getUrlIndex,
           getTermLookup
         ).results
@@ -288,10 +382,20 @@ function runSearch(
   let query: Query = filterTextValue
 
   const recoveredTerms = new Map<string, string[]>()
+  let joinedTerms: string[] = []
   const entryPhraseGroups: string[][] = []
   const canRecoverTerms = fuzzy && !looksLikeUrlQuery(filterTextValue)
+  const queryFuzzyTolerance = (term: string) => {
+    const tolerance = fuzzyTolerance(term)
+    if (!tolerance || !canRecoverTerms) return tolerance
+    return recoveredTerms.has(term) || getTermLookup().recognizes(term)
+      ? false
+      : tolerance
+  }
   if (fuzzy) {
     const parts = filterTextValue.split(/\s+/).filter((p) => p)
+    if (canRecoverTerms && !parsed.phrases.length && parts.length === 2)
+      joinedTerms = getTermLookup().joinedAliases(parts)
     if (parts.length > 0) {
       const dashed = parts.join('-')
       query = {
@@ -308,7 +412,7 @@ function runSearch(
               if (compounds.length) entryPhraseGroups.push([part, ...compounds])
               if (!alternatives.length && !compounds.length) return part
               const queries: Query[] = [
-                { queries: [part], fuzzy: fuzzyTolerance }
+                { queries: [part], fuzzy: queryFuzzyTolerance }
               ]
               if (alternatives.length) {
                 recoveredTerms.set(tokenizeIndexLike(part)[0], alternatives)
@@ -316,7 +420,14 @@ function runSearch(
                   queries: alternatives,
                   combineWith: 'OR',
                   fuzzy: false,
-                  prefix: false
+                  prefix:
+                    normalizeFuzzyTerm(alternatives[0]) !==
+                      normalizeFuzzyTerm(part) &&
+                    alternatives.every(
+                      (term) =>
+                        normalizeFuzzyTerm(term) ===
+                        normalizeFuzzyTerm(alternatives[0])
+                    )
                 })
               }
               for (const phrase of compounds)
@@ -329,13 +440,23 @@ function runSearch(
               return { combineWith: 'OR', queries }
             }),
             combineWith: 'AND',
-            fuzzy: fuzzyTolerance
+            fuzzy: queryFuzzyTolerance
           },
           {
             queries: [dashed],
             combineWith: 'AND',
-            fuzzy: fuzzyTolerance
-          }
+            fuzzy: queryFuzzyTolerance
+          },
+          ...(joinedTerms.length
+            ? [
+                {
+                  queries: joinedTerms,
+                  combineWith: 'OR' as const,
+                  fuzzy: false,
+                  prefix: true
+                }
+              ]
+            : [])
         ]
       }
     }
@@ -348,14 +469,25 @@ function runSearch(
    */
   if (
     !isPhrase &&
-    (!fuzzy || !looksLikeUrlQuery(filterTextValue)) &&
-    !/\s/.test(filterTextValue) &&
+    !looksLikeUrlQuery(filterTextValue) &&
+    !(fuzzy && filterTextValue.length < 5 && /[#+]/.test(filterTextValue)) &&
+    (!/\s/.test(filterTextValue) || joinedTerms.length > 0) &&
     filterTextValue.length > 2
   ) {
     const candidateTerms: string[] = []
-    const match = filterTextValue.toLowerCase()
+    const match = joinedTerms.length
+      ? normalizeFuzzyTerm(filterTextValue.replace(/\s/g, ''))
+      : filterTextValue.toLowerCase()
+    const recovered = [
+      ...(recoveredTerms.get(tokenizeIndexLike(filterTextValue)[0]) ?? []),
+      ...joinedTerms
+    ]
     for (const term of cachedTermKeys) {
-      if (term.includes(match) && term !== match) {
+      if (
+        (term.includes(match) && term !== match) ||
+        (recovered.length > 0 &&
+          recovered.some((needle) => term.includes(needle) && term !== needle))
+      ) {
         candidateTerms.push(term)
       }
     }
@@ -384,10 +516,15 @@ function runSearch(
   // fuzzy only matters for string queries; structured queries carry their own per-clause fuzzy
   const searchOptions = {
     combineWith: 'AND' as const,
-    fuzzy: fuzzy && typeof query === 'string' ? fuzzyTolerance : false,
+    fuzzy: fuzzy && typeof query === 'string' ? queryFuzzyTolerance : false,
     ...(isPhrase ? { prefix: false } : {})
   }
 
+  const withHeadingContext =
+    fuzzy &&
+    !entryPhraseGroups.length &&
+    !looksLikeUrlQuery(filterTextValue) &&
+    tokenizeIndexLike(filterTextValue).length > 1
   const matchesWithoutTerms =
     fuzzy &&
     (parsed.excludedTerms.length ||
@@ -395,7 +532,8 @@ function runSearch(
       sites.length ||
       urls.length ||
       parsed.phrases.length ||
-      entryPhraseGroups.length)
+      entryPhraseGroups.length ||
+      withHeadingContext)
       ? createRemainingMatcher(query, searchOptions)
       : undefined
   const queryLooksLikeUrl = !isPhrase && isExplicitUrlQuery(filterTextValue)
@@ -414,7 +552,18 @@ function runSearch(
     ? findUrlMatches(index, filterTextValue, getUrlIndex())
     : []
   const mergedResultsById = new Map<string, LocalSearchResult>()
+  const programmingSuffixes = fuzzy
+    ? tokenizeIndexLike(filterTextValue).flatMap(
+        (term) => term.match(/[#+]+$/)?.[0] ?? []
+      )
+    : []
   for (const result of rawResults) {
+    if (
+      !programmingSuffixes.every((suffix) =>
+        result.terms.some((term) => term.match(/[#+]+/)?.[0] === suffix)
+      )
+    )
+      continue
     result.substringMatched = result.terms.some((term) =>
       substringTerms?.has(term)
     )
@@ -474,26 +623,31 @@ function runSearch(
   // not against individual tokens. Strip zero-width characters from the
   // query to match the build-time normalization in extractLinkMetadata.
   // Rank unambiguous recoveries using their indexed spelling.
-  const rankingText = recoveredTerms.size
-    ? filterTextValue
-        .split(/\s+/)
-        .map((part) => {
-          const term = tokenizeIndexLike(part)[0]
-          const alternatives = recoveredTerms.get(term)
-          if (!alternatives || getTermLookup().indexedTerms.has(term))
-            return part
-          const key = normalizeFuzzyTerm(alternatives[0])
-          if (
-            !alternatives.every(
-              (candidate) => normalizeFuzzyTerm(candidate) === key
+  const rankingText = joinedTerms.length
+    ? [...joinedTerms].sort()[0]
+    : recoveredTerms.size
+      ? filterTextValue
+          .split(/\s+/)
+          .map((part) => {
+            const term = tokenizeIndexLike(part)[0]
+            const alternatives = recoveredTerms.get(term)
+            if (!alternatives || getTermLookup().indexedTerms.has(term))
+              return part
+            const key = normalizeFuzzyTerm(alternatives[0])
+            if (
+              !alternatives.every(
+                (candidate) => normalizeFuzzyTerm(candidate) === key
+              )
             )
-          )
-            return part
-          return alternatives.includes(key) ? key : [...alternatives].sort()[0]
-        })
-        .join(' ')
-    : filterTextValue
+              return part
+            return alternatives.includes(key)
+              ? key
+              : [...alternatives].sort()[0]
+          })
+          .join(' ')
+      : filterTextValue
   const q = rankingText.replace(INVISIBLE_CHARS_RE, '').trim().toLowerCase()
+  const nameQuery = fuzzy ? normalizeFuzzyTerm(q) : q
   // Multiword fuzzy queries need all query words in one link to earn a word boost.
   const requiredLinkTerms =
     fuzzy && /\s/.test(q) && !looksLikeUrlQuery(q)
@@ -506,7 +660,7 @@ function runSearch(
       : undefined
 
   const singleTerms =
-    !options.urls && !isPhrase && !/\s/.test(q) && !looksLikeUrlQuery(q)
+    !isPhrase && !/\s/.test(q) && !looksLikeUrlQuery(q)
       ? tokenizeIndexLike(q)
       : []
   // Prefer complete words over prefix/substring expansions; Fuzzy tolerates spelling punctuation.
@@ -562,10 +716,18 @@ function runSearch(
       if (!phrases) return
       for (const phrase of phrases) {
         const auxiliary = auxiliaryLabels.has(phrase)
-        if (!auxiliary && q && phrase === q) {
+        let cached = phraseCache.get(phrase)
+        if (!cached) {
+          cached = {}
+          phraseCache.set(phrase, cached)
+        }
+        const name = fuzzy
+          ? (cached.foldedName ??= normalizeFuzzyTerm(phrase))
+          : phrase
+        if (!auxiliary && nameQuery && name === nameQuery) {
           hasExact = true
           if (isStarred) hasStarredExact = true
-        } else if (!auxiliary && q && phrase.startsWith(q)) {
+        } else if (!auxiliary && nameQuery && name.startsWith(nameQuery)) {
           hasPrefix = true
           if (isStarred) hasStarredPrefix = true
         }
@@ -573,11 +735,9 @@ function runSearch(
           lowerTerms.length > 0 &&
           (auxiliary || !(isStarred ? hasStarredWord : hasLinkWord))
         ) {
-          let tokens = phraseTokens.get(phrase)
-          if (!tokens) {
-            tokens = new Set(tokenizeIndexLike(phrase, true))
-            phraseTokens.set(phrase, tokens)
-          }
+          const tokens = (cached.tokens ??= new Set(
+            tokenizeIndexLike(phrase, true)
+          ))
           const words = requiredLinkTerms.length > 1 ? [...tokens] : []
           const matches = matchingPhrases
             ? matchingPhrases.some((form) =>
@@ -627,10 +787,16 @@ function runSearch(
       ...r,
       entryMatch:
         entryPhraseGroups.length ||
+        withHeadingContext ||
         (q && r.urlMatched && !Object.keys(r.match).length)
           ? {
               groups: entryPhraseGroups,
-              headings: [r.title, ...indexedTitles],
+              withHeadingContext,
+              // Language-specific subsections inherit their language heading.
+              headings:
+                withHeadingContext && !r.id.startsWith('/non-english#')
+                  ? [r.title]
+                  : [r.title, ...indexedTitles],
               auxiliary: meta?.a ?? []
             }
           : undefined,
@@ -665,12 +831,24 @@ function runSearch(
 
   boostedResults.sort((a, b) => {
     if (directMatches) {
-      const difference = Number(b.hasDirectWord) - Number(a.hasDirectWord)
+      const difference =
+        Number(b.hasDirectWord || (options.urls && b.urlMatchRank === 3)) -
+        Number(a.hasDirectWord || (options.urls && a.urlMatchRank === 3))
       if (difference) return difference
     }
+    // An inherited heading must not lift removals above equally direct active matches.
+    if (
+      a.isRecentlyRemoved !== b.isRecentlyRemoved &&
+      (!directMatches || a.hasDirectWord === b.hasDirectWord)
+    )
+      return a.isRecentlyRemoved ? 1 : -1
     // Retain exact starred names, then prefer headings over ordinary cross-references.
     if (a.hasStarredExact !== b.hasStarredExact)
       return a.hasStarredExact ? -1 : 1
+    const exactStarredUrlDifference =
+      Number(b.hasStarredUrl && b.urlMatchRank === 3) -
+      Number(a.hasStarredUrl && a.urlMatchRank === 3)
+    if (exactStarredUrlDifference) return exactStarredUrlDifference
     if (a.hasHeadingMatch !== b.hasHeadingMatch)
       return a.hasHeadingMatch ? -1 : 1
     for (const key of tierKeys) {
@@ -737,6 +915,7 @@ function suggestSearch(
   if (
     !query ||
     isPhrase ||
+    looksLikeUrlQuery(query) ||
     sites.length ||
     parsed.excludedTerms.length ||
     parsed.excludedSites.length ||
@@ -749,6 +928,22 @@ function suggestSearch(
   try {
     const { indexedTerms, aliases } = getTermLookup()
     const words = query.split(/\s+/)
+    const programmingSuffix = query.match(/[#+]+$/)?.[0]
+    if (words.length === 1) {
+      if (programmingSuffix && query.length - programmingSuffix.length < 3)
+        return []
+      const compounds = getTermLookup()
+        .compounds(query)
+        .filter(
+          (phrase) =>
+            index.search(phrase, {
+              combineWith: 'AND',
+              fuzzy: false,
+              prefix: true
+            }).length > 0
+        )
+      if (compounds.length) return compounds.sort().slice(0, MAX_SUGGESTIONS)
+    }
     if (words.length > 1) {
       const suggestions = new Set<string>()
       // Join one adjacent pair only when it identifies an indexed curated name.
@@ -824,7 +1019,13 @@ function suggestSearch(
         candidates.set(term, { suggestion: term, terms: [term], score: 0 })
     }
     const foldedQuery = normalizeFuzzyTerm(cleanQuery)
+    const recognizedQuery = getTermLookup().recognizes(cleanQuery)
     const sortedSuggestions = [...candidates.values()]
+      .filter(
+        (candidate) =>
+          !programmingSuffix ||
+          candidate.suggestion.match(/[#+]+/)?.[0] === programmingSuffix
+      )
       .map((candidate) => ({
         ...candidate,
         distance: spellingDistance(
@@ -832,6 +1033,7 @@ function suggestSearch(
           normalizeFuzzyTerm(candidate.suggestion)
         )
       }))
+      .filter((candidate) => !recognizedQuery || candidate.distance === 0)
       .sort((a, b) => {
         if (a.distance !== b.distance) return a.distance - b.distance
         const aSug = a.suggestion.toLowerCase()
@@ -852,7 +1054,9 @@ function suggestSearch(
         return (b.score || 0) - (a.score || 0) || aSug.localeCompare(bSug)
       })
 
+    const bestDistance = sortedSuggestions[0]?.distance
     return sortedSuggestions
+      .filter((candidate) => candidate.distance === bestDistance)
       .map((s) => s.suggestion)
       .filter((s) => s && !/\s/.test(s) && s !== query.toLowerCase())
       .slice(0, MAX_SUGGESTIONS)
@@ -898,7 +1102,7 @@ export function createSearchEngine(
   // MiniSearch has no public term iterator; keep this compatibility access local.
   const internal = index as unknown as { _index?: Map<string, unknown> }
   const terms = internal._index ? [...internal._index.keys()] : []
-  const phraseTokens = new Map<string, Set<string>>()
+  const phraseCache = new Map<string, CachedLinkPhrase>()
   let urlIndex: UrlRecord[] | undefined
   let links: ReturnType<typeof collectLinkTerms> | undefined
   let termLookup: ReturnType<typeof createTermLookup> | undefined
@@ -912,7 +1116,7 @@ export function createSearchEngine(
         query,
         options,
         sidebar,
-        phraseTokens,
+        phraseCache,
         () => (urlIndex ??= buildUrlIndex(metadata)),
         getTermLookup
       )

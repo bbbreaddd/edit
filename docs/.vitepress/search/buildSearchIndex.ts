@@ -350,7 +350,9 @@ export const search: DefaultTheme.Config['search'] = {
         const headingContentRegex = /(.*?)<a.*? href="#(.*?)".*?>.*?<\/a>/i
 
         const clearHtmlTags = (str: string) =>
-          str.replace(/<[^>]*>/g, '').replace(/&amp;/g, '&')
+          str
+            .replace(/<(?:[^>"']|"[^"]*"|'[^']*')*>/g, '')
+            .replace(/&amp;/g, '&')
         const getSearchableText = (content: string) => clearHtmlTags(content)
 
         const result = html.split(headingRegex)

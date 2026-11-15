@@ -155,6 +155,7 @@ export function buildUrlQuery(query: string): UrlQuery | null {
   // A typed scheme or leading "www." anchors the match to the host start.
   const anchored =
     /^[a-z][a-z0-9+.-]*:\/\//.test(normalized) || normalized.startsWith('www.')
+  if (!anchored && /\s/.test(query.trim())) return null
   const stripped = normalizeSearchUrl(normalized)
   // A "/" means the user typed a path, so match against host + path directly.
   if (stripped.includes('/')) {
@@ -166,6 +167,7 @@ export function buildUrlQuery(query: string): UrlQuery | null {
       anchored
     }
   }
+  if (!stripped.includes('.') && /[#+]/.test(stripped)) return null
   // A "." means the user typed a domain with its TLD (pi-hole.net) → match the
   // full host. Otherwise it's a bare word → match the registrable label.
   return {

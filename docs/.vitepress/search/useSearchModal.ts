@@ -51,7 +51,6 @@ import { isExplicitUrlQuery, looksLikeUrlQuery } from './urlMatching'
 const RESULTS_PAGE_SIZE = 16
 const MAX_RECENT_SEARCHES = 20
 const SEARCH_DEBOUNCE_MS = 350
-const MIN_CANDIDATE_POOL = 32
 
 // Keep the latest loaders alive while the modal is closed.
 const searchIndexSource = shallowRef(localSearchIndex)
@@ -533,23 +532,24 @@ export function useSearchModal() {
         .toLowerCase()
       const needsContentFiltering =
         hasExclusions ||
-        scopedResults.some((result) => !!result.entryMatch?.groups.length) ||
+        allRes.some(
+          (result) =>
+            !!result.entryMatch?.groups.length ||
+            result.entryMatch?.withHeadingContext
+        ) ||
         searchQuery.sites.length > 0 ||
         searchQuery.urls.length > 0 ||
         searchQuery.phrases.length > 0 ||
         (!fuzzy &&
           (/\s/.test(searchQuery.text) ||
-            scopedResults.some(
+            allRes.some(
               (result) =>
                 !result.substringMatched &&
                 !result.urlMatched &&
                 !result.terms.some((term) => term.includes(literalQuery))
             )))
-      // Content filtering needs a wider pool in both compact and detailed views.
-      const candidateLimit = Math.max(MIN_CANDIDATE_POOL, limit * 2)
-      const candidates = needsContentFiltering
-        ? scopedResults.slice(0, candidateLimit)
-        : sliced
+      // Qualify the bounded engine result set before pagination or category counts.
+      const candidates = needsContentFiltering ? allRes : sliced
       const needsPreviewFiltering =
         needsContentFiltering ||
         candidates.some((result) => !!result.entryMatch)
@@ -574,9 +574,10 @@ export function useSearchModal() {
       const filtered = needsPreviewFiltering
         ? filterResults(mapped, query, true, fuzzy)
         : mapped
-      const finalResults = needsContentFiltering
-        ? filtered.slice(0, limit)
+      const scopedMatches = category
+        ? filtered.filter((result) => resultCategoryOf(result.id) === category)
         : filtered
+      const finalResults = scopedMatches.slice(0, limit)
       if (showDetailedListValue) {
         await loadExcerpts(finalResults, vitePressData, isCanceled)
         if (isCanceled()) return
@@ -586,16 +587,14 @@ export function useSearchModal() {
         }
       }
       const totalCount = needsContentFiltering
-        ? filtered.length
+        ? scopedMatches.length
         : mapped.length + Math.max(0, scopedResults.length - limit)
-      // Expanding the limit also expands the pool of exact matches being checked.
-      const mayHaveMoreValue =
-        needsContentFiltering && scopedResults.length > candidateLimit
+      const mayHaveMoreValue = false
 
       if (resultSetChanged) {
         // A category's preview filtering must not remove the other category chips.
         categoryCounts.value = computeCategoryCounts(
-          needsContentFiltering && !category ? filtered : allRes
+          needsContentFiltering ? filtered : allRes
         )
       }
 

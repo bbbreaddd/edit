@@ -249,8 +249,20 @@ export async function highlightSearchResults(
                 .map((entry) => normalizeExcerptText(entry.context))
             )
             const entryTexts = new WeakMap<Element, string>()
+            const contextHeadings = match.entryMatch?.withHeadingContext
+              ? (match.entryMatch.headings ?? [])
+              : []
             const markTerms = entries
-              ? new Set(entries.flatMap((entry) => entry.phrases))
+              ? new Set([
+                  ...entries.flatMap((entry) => entry.phrases),
+                  ...match.terms.filter((term) =>
+                    contextHeadings.some((heading) =>
+                      normalizeExcerptText(heading).includes(
+                        normalizeExcerptText(term)
+                      )
+                    )
+                  )
+                ])
               : result.searchBranches
                 ? new Set(Object.keys(match.match))
                 : terms
@@ -258,12 +270,15 @@ export async function highlightSearchResults(
               if (!entries) return true
               const title = element?.closest('.titles')
               if (title)
-                return entries.some(
-                  (entry) =>
-                    entry.heading &&
-                    normalizeExcerptText(title.textContent ?? '').includes(
-                      normalizeExcerptText(entry.context)
-                    )
+                return [
+                  ...contextHeadings,
+                  ...entries
+                    .filter((entry) => entry.heading)
+                    .map((entry) => entry.context)
+                ].some((heading) =>
+                  normalizeExcerptText(title.textContent ?? '').includes(
+                    normalizeExcerptText(heading)
+                  )
                 )
               const entry = element?.closest(SEARCH_ENTRY_SELECTOR)
               if (!entry) return false

@@ -40,6 +40,7 @@ export type LocalSearchResult = SearchResult &
     ) => boolean
     entryMatch?: {
       groups: string[][]
+      withHeadingContext?: boolean
       headings?: string[]
       auxiliary: string[]
       entries?: SearchEntryMatch[]
