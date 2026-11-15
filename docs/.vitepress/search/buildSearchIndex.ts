@@ -89,7 +89,8 @@ function extractLinkMetadata(html: string) {
   const starredBoldLinks = new Set<string>()
   const urls = new Set<string>()
   const starredUrls = new Set<string>()
-  const stripTags = (str: string) => str.replace(/<[^>]*>/g, ' ')
+  const stripTags = (str: string) =>
+    str.replace(/<[^>]*>/g, ' ').replace(/&amp;/g, '&')
   // Strip zero-width / word-joiner chars. The FMHY wiki sprinkles U+2060 (and
   // occasionally U+200B) inside link text as a visual workaround; leaving them
   // in metadata phrases breaks exact/prefix tier matching at search time.
@@ -321,7 +322,8 @@ export const search: DefaultTheme.Config['search'] = {
           /<h(\d*).*?>(.*?<a.*? href="#.*?".*?>.*?<\/a>)<\/h\1>/gi
         const headingContentRegex = /(.*?)<a.*? href="#(.*?)".*?>.*?<\/a>/i
 
-        const clearHtmlTags = (str: string) => str.replace(/<[^>]*>/g, '')
+        const clearHtmlTags = (str: string) =>
+          str.replace(/<[^>]*>/g, '').replace(/&amp;/g, '&')
         const getSearchableText = (content: string) => clearHtmlTags(content)
 
         const result = html.split(headingRegex)

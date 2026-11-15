@@ -96,7 +96,16 @@ export function tokenizeSearchText(text: string): string[] {
   // Preserve C#/F# as terms; other hashes separate words.
   return text
     .replace(/\u2060|\u200B|\u200C|\u200D|\uFEFF/g, '')
-    .split(/[\n\r %*,=/:;?[\]{}()&]+|(?<!\b[cf])#|#(?=[\p{L}\p{N}_])/iu)
+    .split(/[\n\r %*,=/:;?[\]{}()]+|(?<!\b[cf])#|#(?=[\p{L}\p{N}_])/iu)
+    .flatMap((term) => {
+      if (!term.includes('&')) return term
+      const parts = term.split(/&+/)
+      return /^[\p{L}\p{N}]+(?:&[\p{L}\p{N}]+)+$/u.test(
+        term.replace(/^\.+|\.+$/g, '')
+      )
+        ? [term, ...parts]
+        : parts
+    })
 }
 
 export function processSearchTerm(
