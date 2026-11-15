@@ -38,10 +38,9 @@ import {
 import { createSearchNavigation } from './resultNavigation'
 import {
   excerptCache,
-  fetchExcerpt,
   filterResults,
-  lookupExcerptText,
-  processExcerpts
+  loadExcerpts,
+  lookupExcerptText
 } from './resultPreviews'
 import { createSearchEngine, loadSearchIndex } from './searchEngine'
 import {
@@ -538,17 +537,13 @@ export function useSearchModal() {
         ? scopedResults.slice(0, candidateLimit)
         : sliced
       const includeExcerpts = needsPhraseFiltering || showDetailedListValue
-      const toFetch = includeExcerpts
-        ? candidates.filter(
-            (result) => !excerptCache.has(result.id.split('#')[0])
-          )
-        : []
-      const mods = await Promise.all(
-        toFetch.map((result) => fetchExcerpt(result.id))
+      const knownMatches = new Set(filterResults(candidates, query, false))
+      const previewCandidates = candidates.filter(
+        (result, index) =>
+          (needsPhraseFiltering && !knownMatches.has(result)) ||
+          (showDetailedListValue && index < limit)
       )
-      if (isCanceled()) return
-
-      await processExcerpts(mods, vitePressData, isCanceled)
+      await loadExcerpts(previewCandidates, vitePressData, isCanceled)
       if (isCanceled()) return
 
       const mapped = candidates.map((result) => {
@@ -566,6 +561,12 @@ export function useSearchModal() {
       const finalResults = needsPhraseFiltering
         ? filtered.slice(0, limit)
         : filtered
+      if (showDetailedListValue) {
+        await loadExcerpts(finalResults, vitePressData, isCanceled)
+        if (isCanceled()) return
+        for (const result of finalResults)
+          result.text = lookupExcerptText(result.id)
+      }
       const totalCount = needsPhraseFiltering
         ? filtered.length
         : mapped.length + Math.max(0, scopedResults.length - limit)

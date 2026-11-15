@@ -48,6 +48,18 @@ export async function fetchExcerpt(id: string) {
   }
 }
 
+export async function loadExcerpts(
+  results: LocalSearchResult[],
+  vitePressData: ReturnType<typeof useData>,
+  isCanceled: () => boolean
+) {
+  const pages = new Set(results.map((result) => result.id.split('#')[0]))
+  const missing = [...pages].filter((page) => !excerptCache.has(page))
+  if (!missing.length || isCanceled()) return
+  const mods = await Promise.all(missing.map(fetchExcerpt))
+  if (!isCanceled()) await processExcerpts(mods, vitePressData, isCanceled)
+}
+
 interface ComponentModule {
   default?: unknown
   render?: unknown
@@ -138,7 +150,8 @@ export async function processExcerpts(
 
 export function filterResults(
   results: LocalSearchResult[],
-  filterTextValue: string
+  filterTextValue: string,
+  allowMissingText = true
 ) {
   const clean = (s: string) =>
     s
@@ -155,7 +168,7 @@ export function filterResults(
     if (clean(r.title).includes(phrase)) return true
     if (r.titles.some((t) => clean(t).includes(phrase))) return true
     if (r.urlMatched || r.substringMatched) return true
-    if (!r.text) return true // Keep optimistically if text is not fetched yet
+    if (!r.text) return allowMissingText
     return clean(r.text).includes(phrase)
   })
 }

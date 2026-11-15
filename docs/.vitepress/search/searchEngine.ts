@@ -75,6 +75,7 @@ function runSearch(
   filterTextValue: string,
   options: { fuzzy: boolean; urls: boolean },
   sidebar: SidebarItem[],
+  phraseTokens: Map<string, Set<string>>,
   getUrlIndex: () => UrlRecord[]
 ) {
   let substringTerms: Set<string> | undefined
@@ -219,8 +220,15 @@ function runSearch(
           hasPrefix = true
           if (isStarred) hasStarredPrefix = true
         }
-        if (lowerTerms.length > 0) {
-          const tokens = new Set(tokenizeIndexLike(phrase, true))
+        if (
+          lowerTerms.length > 0 &&
+          !(isStarred ? hasStarredWord : hasLinkWord)
+        ) {
+          let tokens = phraseTokens.get(phrase)
+          if (!tokens) {
+            tokens = new Set(tokenizeIndexLike(phrase, true))
+            phraseTokens.set(phrase, tokens)
+          }
           if (lowerTerms.some((t) => tokens.has(t))) {
             if (isStarred) hasStarredWord = true
             else hasLinkWord = true
@@ -368,6 +376,7 @@ export function createSearchEngine(
   // MiniSearch has no public term iterator; keep this compatibility access local.
   const internal = index as unknown as { _index?: Map<string, unknown> }
   const terms = internal._index ? [...internal._index.keys()] : []
+  const phraseTokens = new Map<string, Set<string>>()
   let urlIndex: UrlRecord[] | undefined
   let links: ReturnType<typeof collectLinkTerms> | undefined
   return {
@@ -379,6 +388,7 @@ export function createSearchEngine(
         query,
         options,
         sidebar,
+        phraseTokens,
         () => (urlIndex ??= buildUrlIndex(metadata))
       )
     },

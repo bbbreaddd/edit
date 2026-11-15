@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import { useSearchModal } from '../../search/useSearchModal'
 import { sanitizeRichHtml, sanitizeSearchHtml } from '../composables/sanitize'
 
@@ -49,6 +50,15 @@ const {
   onMouseMove,
   onResultsKeydown
 } = useSearchModal()
+
+const renderedResults = computed(() =>
+  results.value.map((result) => ({
+    ...result,
+    titleHtml: sanitizeSearchHtml(result.title),
+    titlesHtml: result.titles.map(sanitizeSearchHtml),
+    textHtml: showDetailedList.value ? sanitizeRichHtml(result.text) : ''
+  }))
+)
 </script>
 
 <template>
@@ -259,7 +269,7 @@ const {
           >
             <TransitionGroup name="result-list">
               <li
-                v-for="(p, index) in results"
+                v-for="(p, index) in renderedResults"
                 :id="'localsearch-item-' + index"
                 :key="p.id"
                 :data-id="p.id"
@@ -281,11 +291,11 @@ const {
                     <div class="titles">
                       <span class="title-icon">#</span>
                       <span
-                        v-for="(t, titleIndex) in p.titles"
+                        v-for="(titleHtml, titleIndex) in p.titlesHtml"
                         :key="titleIndex"
                         class="title"
                       >
-                        <span class="text" v-html="sanitizeSearchHtml(t)" />
+                        <span class="text" v-html="titleHtml" />
                         <span class="vpi-chevron-right local-search-icon" />
                       </span>
                       <span class="title main">
@@ -294,16 +304,13 @@ const {
                           class="result-link"
                           :aria-label="[...p.titles, p.title].join(' > ')"
                         >
-                          <span
-                            class="text"
-                            v-html="sanitizeSearchHtml(p.title)"
-                          />
+                          <span class="text" v-html="p.titleHtml" />
                         </a>
                       </span>
                     </div>
                     <div v-if="showDetailedList" class="excerpt-wrapper">
                       <div v-if="p.text" class="excerpt" inert>
-                        <div class="vp-doc" v-html="sanitizeRichHtml(p.text)" />
+                        <div class="vp-doc" v-html="p.textHtml" />
                       </div>
 
                       <div class="excerpt-gradient-bottom" />
