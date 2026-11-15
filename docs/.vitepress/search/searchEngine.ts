@@ -302,12 +302,12 @@ function runSearch(
 
   /**
    * Suffix Search / Substring Matching:
-   * For exact mode, find index terms containing the query as a substring
+   * Find index terms containing the query as a substring
    * (e.g. "abolic" → "parabolic") using the pre-cached term key list.
    */
   if (
-    !fuzzy &&
     !isPhrase &&
+    (!fuzzy || !looksLikeUrlQuery(filterTextValue)) &&
     !/\s/.test(filterTextValue) &&
     filterTextValue.length > 2
   ) {
@@ -325,7 +325,17 @@ function runSearch(
       substringTerms = new Set(capped)
       query = {
         combineWith: 'OR',
-        queries: [filterTextValue, ...capped]
+        queries: fuzzy
+          ? [
+              query,
+              {
+                queries: capped,
+                combineWith: 'OR',
+                fuzzy: false,
+                prefix: false
+              }
+            ]
+          : [filterTextValue, ...capped]
       }
     }
   }
@@ -478,12 +488,14 @@ function runSearch(
   const headingPattern = singleTerms.length === 1 ? createPhraseRegex(q) : null
   const boostedResults = currentResults.map((r) => {
     const meta = metadata[r.id]
+    const auxiliaryLabels = new Set(meta?.a)
     let hasStarredExact = false
     let hasExact = false
     let hasStarredPrefix = false
     let hasPrefix = false
     let hasStarredWord = false
     let hasLinkWord = false
+    let hasAuxiliaryWord = false
 
     const lowerTerms = r.terms ? r.terms.map((t) => t.toLowerCase()) : []
 
@@ -493,16 +505,17 @@ function runSearch(
     ) => {
       if (!phrases) return
       for (const phrase of phrases) {
-        if (q && phrase === q) {
+        const auxiliary = auxiliaryLabels.has(phrase)
+        if (!auxiliary && q && phrase === q) {
           hasExact = true
           if (isStarred) hasStarredExact = true
-        } else if (q && phrase.startsWith(q)) {
+        } else if (!auxiliary && q && phrase.startsWith(q)) {
           hasPrefix = true
           if (isStarred) hasStarredPrefix = true
         }
         if (
           lowerTerms.length > 0 &&
-          !(isStarred ? hasStarredWord : hasLinkWord)
+          (auxiliary || !(isStarred ? hasStarredWord : hasLinkWord))
         ) {
           let tokens = phraseTokens.get(phrase)
           if (!tokens) {
@@ -516,7 +529,8 @@ function runSearch(
               )
             : lowerTerms.some((term) => tokens.has(term))
           if (matches) {
-            if (isStarred) hasStarredWord = true
+            if (auxiliary) hasAuxiliaryWord = true
+            else if (isStarred) hasStarredWord = true
             else hasLinkWord = true
           }
         }
@@ -534,6 +548,17 @@ function runSearch(
     const hasStarredUrl = !!r.urlMatchedStarred
     const hasLinkUrl = !!r.urlMatched && !hasStarredUrl
 
+    const hasHeadingMatch =
+      !!headingPattern &&
+      // Sidebar labels are display context; use the indexed heading hierarchy.
+      [
+        r.title,
+        ...((index.getStoredFields(r.id) as Result | undefined)?.titles ?? [])
+      ].some((title) => headingPattern.test(title))
+    const hasDirectWord =
+      !!directMatches?.has(r.id) &&
+      !(hasAuxiliaryWord && !hasStarredWord && !hasLinkWord && !hasHeadingMatch)
+
     return {
       ...r,
       matchesWithoutTerms:
@@ -549,13 +574,8 @@ function runSearch(
       hasStarredUrl,
       hasLinkWord,
       hasLinkUrl,
-      hasHeadingMatch:
-        !!headingPattern &&
-        // Sidebar labels are display context; use the indexed heading hierarchy.
-        [
-          r.title,
-          ...((index.getStoredFields(r.id) as Result | undefined)?.titles ?? [])
-        ].some((title) => headingPattern.test(title)),
+      hasHeadingMatch,
+      hasDirectWord,
       isRecentlyRemoved: /^\/recently-removed(?:\.html)?(?:#|$)/.test(r.id)
     }
   })
@@ -572,8 +592,7 @@ function runSearch(
 
   boostedResults.sort((a, b) => {
     if (directMatches) {
-      const difference =
-        Number(directMatches.has(b.id)) - Number(directMatches.has(a.id))
+      const difference = Number(b.hasDirectWord) - Number(a.hasDirectWord)
       if (difference) return difference
     }
     // Retain exact starred names, then prefer headings over ordinary cross-references.

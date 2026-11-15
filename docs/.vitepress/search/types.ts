@@ -22,6 +22,7 @@ export interface LinkMetadata {
   s?: string[]
   u?: string[]
   su?: string[]
+  a?: string[]
 }
 export type SearchMetadata = Record<string, LinkMetadata>
 export type LocalSearchResult = SearchResult &

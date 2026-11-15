@@ -50,7 +50,8 @@ const URL_SHORTENER_HOSTS = new Set([
 ])
 
 // l = regular (or bold-only) hyperlinks, s = bold + starred (curated picks),
-// u = link hrefs for URL search, su = hrefs from starred list items.
+// u = link hrefs for URL search, su = hrefs from starred list items,
+// a = auxiliary link labels after a resource description.
 // Bold-without-star is just an index label, no special ranking – folded into l.
 const globalLinkMetadata: SearchMetadata = {}
 
@@ -86,6 +87,8 @@ function extractLinkMetadata(html: string) {
   // Warning prose stays searchable, but its links are not curated entries.
   html = html.replace(/<CriticalBadge\b[\s\S]*?<\/CriticalBadge\s*>/gi, '')
   const links = new Set<string>()
+  const auxiliaryLinks = new Set<string>()
+  const resourceLinks = new Set<string>()
   const starredBoldLinks = new Set<string>()
   const urls = new Set<string>()
   const starredUrls = new Set<string>()
@@ -137,6 +140,22 @@ function extractLinkMetadata(html: string) {
     )
   }
 
+  const isAuxiliary = (index: number) => {
+    const start = Math.max(
+      html.lastIndexOf('<li ', index),
+      html.lastIndexOf('<li>', index)
+    )
+    if (start < 0 || start < html.lastIndexOf('</li>', index)) return false
+    const prefix = html.slice(start, index)
+    // Description separators inside a preceding resource name are not structural.
+    return (
+      prefix.includes('</a>') &&
+      /(?:^|\s)[-–—](?:\s|$)/.test(
+        cleanText(prefix.replace(/<a\b[^>]*>[\s\S]*?<\/a>/gi, ''))
+      )
+    )
+  }
+
   const boldRegex =
     /<strong\b[^>]*>([\s\S]*?)<\/strong>|<b\b[^>]*>([\s\S]*?)<\/b>/i
 
@@ -152,6 +171,8 @@ function extractLinkMetadata(html: string) {
     const innerHtml = match[1]
     const cleaned = cleanText(innerHtml)
     if (!cleaned) continue
+    const labels = isAuxiliary(match.index) ? auxiliaryLinks : resourceLinks
+    labels.add(cleaned)
     if (boldRegex.test(innerHtml) && isStarred(match.index)) {
       starredBoldLinks.add(cleaned)
     } else {
@@ -166,6 +187,8 @@ function extractLinkMetadata(html: string) {
     if (/<a\b[^>]*>([\s\S]*?)<\/a>/i.test(innerHtml)) {
       const cleaned = cleanText(innerHtml)
       if (cleaned) {
+        const labels = isAuxiliary(match.index) ? auxiliaryLinks : resourceLinks
+        labels.add(cleaned)
         if (isStarred(match.index)) {
           starredBoldLinks.add(cleaned)
         } else {
@@ -181,7 +204,10 @@ function extractLinkMetadata(html: string) {
     links: Array.from(links),
     starredBoldLinks: Array.from(starredBoldLinks),
     urls: Array.from(urls),
-    starredUrls: Array.from(starredUrls)
+    starredUrls: Array.from(starredUrls),
+    auxiliaryLinks: [...auxiliaryLinks].filter(
+      (label) => !resourceLinks.has(label)
+    )
   }
 }
 
@@ -344,7 +370,7 @@ export const search: DefaultTheme.Config['search'] = {
 
           const sectionId = anchor ? `${fileId}#${anchor}` : fileId
 
-          const { links, starredBoldLinks, urls, starredUrls } =
+          const { links, starredBoldLinks, urls, starredUrls, auxiliaryLinks } =
             extractLinkMetadata(content)
           if (
             links.length > 0 ||
@@ -356,7 +382,8 @@ export const search: DefaultTheme.Config['search'] = {
               l: links,
               s: starredBoldLinks,
               u: urls,
-              su: starredUrls
+              su: starredUrls,
+              ...(auxiliaryLinks.length ? { a: auxiliaryLinks } : {})
             }
           }
 
