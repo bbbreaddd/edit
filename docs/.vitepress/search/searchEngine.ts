@@ -82,7 +82,7 @@ function fuzzyTolerance(term: string) {
   return term.length < 9 ? 1 : 2
 }
 
-function createTermLookup(terms: string[]) {
+function createTermLookup(terms: string[], metadata: SearchMetadata) {
   const indexedTerms = new Set(terms)
   const aliases = new Map<string, string[]>()
   for (const term of terms) {
@@ -92,9 +92,34 @@ function createTermLookup(terms: string[]) {
     if (group) group.push(term)
     else aliases.set(key, indexedTerms.has(key) ? [key, term] : [term])
   }
+  const compoundPhrases = new Map<string, Set<string>>()
+  const resourcePhrases = new Set<string>()
+  for (const item of Object.values(metadata)) {
+    const auxiliary = new Set(item.a)
+    for (const phrase of [...(item.s ?? []), ...(item.l ?? [])])
+      if (!auxiliary.has(phrase)) resourcePhrases.add(phrase)
+  }
+  for (const phrase of resourcePhrases) {
+    const words = phrase.split(/\s+/).map((word) => tokenizeIndexLike(word))
+    for (let i = 0; i < words.length - 1; i++) {
+      if (words[i].length !== 1 || words[i + 1].length !== 1) continue
+      const pair = [words[i][0], words[i + 1][0]]
+      const key = normalizeFuzzyTerm(pair.join(''))
+      if (key.length < 5) continue
+      const group = compoundPhrases.get(key) ?? new Set<string>()
+      group.add(pair.join(' '))
+      compoundPhrases.set(key, group)
+    }
+  }
   return {
     indexedTerms,
     aliases,
+    compounds(word: string) {
+      const tokens = tokenizeIndexLike(word)
+      return tokens.length === 1
+        ? [...(compoundPhrases.get(normalizeFuzzyTerm(tokens[0])) ?? [])]
+        : []
+    },
     alternatives(word: string) {
       const tokens = tokenizeIndexLike(word)
       if (tokens.length !== 1) return []
@@ -268,24 +293,33 @@ function runSearch(
         queries: [
           {
             queries: parts.map((part): Query => {
-              const alternatives =
+              const lookup =
                 canRecoverTerms && !looksLikeUrlQuery(part)
-                  ? getTermLookup().alternatives(part)
-                  : []
-              if (!alternatives.length) return part
-              recoveredTerms.set(tokenizeIndexLike(part)[0], alternatives)
-              return {
-                combineWith: 'OR',
-                queries: [
-                  { queries: [part], fuzzy: fuzzyTolerance },
-                  {
-                    queries: alternatives,
-                    combineWith: 'OR',
-                    fuzzy: false,
-                    prefix: false
-                  }
-                ]
+                  ? getTermLookup()
+                  : undefined
+              const alternatives = lookup?.alternatives(part) ?? []
+              const compounds = lookup?.compounds(part) ?? []
+              if (!alternatives.length && !compounds.length) return part
+              const queries: Query[] = [
+                { queries: [part], fuzzy: fuzzyTolerance }
+              ]
+              if (alternatives.length) {
+                recoveredTerms.set(tokenizeIndexLike(part)[0], alternatives)
+                queries.push({
+                  queries: alternatives,
+                  combineWith: 'OR',
+                  fuzzy: false,
+                  prefix: false
+                })
               }
+              for (const phrase of compounds)
+                queries.push({
+                  queries: [phrase],
+                  combineWith: 'AND',
+                  fuzzy: false,
+                  prefix: true
+                })
+              return { combineWith: 'OR', queries }
             }),
             combineWith: 'AND',
             fuzzy: fuzzyTolerance
@@ -458,6 +492,16 @@ function runSearch(
       ? [...new Set(tokenizeIndexLike(q))]
       : []
 
+  const compoundLinkTerms =
+    fuzzy && !/\s/.test(q)
+      ? getTermLookup()
+          .compounds(q)
+          .map((phrase) => tokenizeIndexLike(phrase))
+      : []
+  const compoundKey = compoundLinkTerms.length ? normalizeFuzzyTerm(q) : ''
+  const linkTermGroups =
+    requiredLinkTerms.length > 1 ? [requiredLinkTerms] : compoundLinkTerms
+
   const singleTerms =
     !options.urls && !isPhrase && !/\s/.test(q) && !looksLikeUrlQuery(q)
       ? tokenizeIndexLike(q)
@@ -522,10 +566,16 @@ function runSearch(
             tokens = new Set(tokenizeIndexLike(phrase, true))
             phraseTokens.set(phrase, tokens)
           }
-          const words = requiredLinkTerms.length > 1 ? [...tokens] : undefined
-          const matches = words
-            ? requiredLinkTerms.every((term) =>
-                words.some((word) => word.startsWith(term))
+          const words = linkTermGroups.length ? [...tokens] : []
+          const matches = linkTermGroups.length
+            ? (compoundLinkTerms.length > 0 &&
+                words.some((word) =>
+                  normalizeFuzzyTerm(word).includes(compoundKey)
+                )) ||
+              linkTermGroups.some((parts) =>
+                parts.every((part) =>
+                  words.some((word) => word.startsWith(part))
+                )
               )
             : lowerTerms.some((term) => tokens.has(term))
           if (matches) {
@@ -829,7 +879,7 @@ export function createSearchEngine(
   let urlIndex: UrlRecord[] | undefined
   let links: ReturnType<typeof collectLinkTerms> | undefined
   let termLookup: ReturnType<typeof createTermLookup> | undefined
-  const getTermLookup = () => (termLookup ??= createTermLookup(terms))
+  const getTermLookup = () => (termLookup ??= createTermLookup(terms, metadata))
   return {
     search(query: string, options: { fuzzy: boolean; urls: boolean }) {
       return runSearch(
