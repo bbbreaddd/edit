@@ -532,7 +532,16 @@ function runSearch(
         )
       : undefined
 
-  const headingPattern = singleTerms.length === 1 ? createPhraseRegex(q) : null
+  const headingPhrases =
+    singleTerms.length === 1 ||
+    (!isPhrase && /\s/.test(q) && !looksLikeUrlQuery(q)) ||
+    matchingPhrases
+      ? (matchingPhrases ?? [q])
+      : []
+  const headingPatterns = headingPhrases.map((phrase) => ({
+    pattern: createPhraseRegex(phrase),
+    prefix: /\s/.test(phrase) ? phrase.toLowerCase() : ''
+  }))
   const boostedResults = currentResults.map((r) => {
     const meta = metadata[r.id]
     const auxiliaryLabels = new Set(meta?.a)
@@ -602,9 +611,14 @@ function runSearch(
     const indexedTitles =
       (index.getStoredFields(r.id) as Result | undefined)?.titles ?? []
     const hasHeadingMatch =
-      !!headingPattern &&
       // Sidebar labels are display context; use the indexed heading hierarchy.
-      [r.title, ...indexedTitles].some((title) => headingPattern.test(title))
+      [r.title, ...indexedTitles].some((title) =>
+        headingPatterns.some(
+          ({ pattern, prefix }) =>
+            pattern.test(title) ||
+            (!!prefix && title.toLowerCase().startsWith(prefix))
+        )
+      )
     const hasDirectWord =
       !!directMatches?.has(r.id) &&
       !(hasAuxiliaryWord && !hasStarredWord && !hasLinkWord && !hasHeadingMatch)

@@ -171,8 +171,13 @@ export function buildUrlQuery(query: string): UrlQuery | null {
   return {
     mode: 'domain',
     needle: '',
+    // Compact aliases must also meet the minimum length (C++ must not become "c").
     needles: [
-      ...new Set([stripped, compactUrlValue(stripped)].filter(Boolean))
+      ...new Set(
+        [stripped, compactUrlValue(stripped)].filter(
+          (needle) => needle.length >= 3
+        )
+      )
     ],
     matchFullHost: stripped.includes('.'),
     anchored
