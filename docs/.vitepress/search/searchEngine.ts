@@ -77,7 +77,7 @@ function runSearch(
   sidebar: SidebarItem[],
   getUrlIndex: () => UrlRecord[]
 ) {
-  let usedSubstringExpansion = false
+  let substringTerms: Set<string> | undefined
   let query: Query = filterTextValue
 
   if (options.fuzzy) {
@@ -119,7 +119,7 @@ function runSearch(
       // Sort by length ascending so shorter words win the cap
       candidateTerms.sort((a, b) => a.length - b.length)
       const capped = candidateTerms.slice(0, MAX_SUBSTRING_TERMS)
-      usedSubstringExpansion = true
+      substringTerms = new Set(capped)
       query = {
         combineWith: 'OR',
         queries: [filterTextValue, ...capped]
@@ -145,6 +145,9 @@ function runSearch(
     : []
   const mergedResultsById = new Map<string, LocalSearchResult>()
   for (const result of rawResults) {
+    result.substringMatched = result.terms.some((term) =>
+      substringTerms?.has(term)
+    )
     mergedResultsById.set(result.id, result)
   }
   for (const result of urlResults) {
@@ -279,8 +282,7 @@ function runSearch(
   })
 
   return {
-    results: boostedResults.slice(0, MAX_RESULTS_IN_MEMORY),
-    usedSubstringExpansion
+    results: boostedResults.slice(0, MAX_RESULTS_IN_MEMORY)
   }
 }
 

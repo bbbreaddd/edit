@@ -154,7 +154,7 @@ export function filterResults(
   return results.filter((r) => {
     if (clean(r.title).includes(phrase)) return true
     if (r.titles.some((t) => clean(t).includes(phrase))) return true
-    if (r.urlMatched) return true
+    if (r.urlMatched || r.substringMatched) return true
     if (!r.text) return true // Keep optimistically if text is not fetched yet
     return clean(r.text).includes(phrase)
   })

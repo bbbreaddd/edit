@@ -7,6 +7,7 @@ export interface Result {
   urlMatched?: boolean
   urlMatchedStarred?: boolean
   urlMatchRank?: number
+  substringMatched?: boolean
 }
 
 export interface SidebarItem {

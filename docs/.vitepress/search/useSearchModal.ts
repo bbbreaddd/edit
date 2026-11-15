@@ -87,7 +87,6 @@ const globalResults = ref<LocalSearchResult[]>([])
 const globalAllResults = ref<LocalSearchResult[]>([])
 const globalTotalResultsCount = ref(0)
 const globalResultLimit = ref(RESULTS_PAGE_SIZE)
-const globalUsedSubstringExpansion = ref(false)
 const globalMayHaveMore = ref(false)
 
 export function useSearchModal() {
@@ -337,9 +336,6 @@ export function useSearchModal() {
 
   const enableNoResults = ref(isRestoring)
   const isSearching = ref(!isRestoring && !!filterText.value)
-  const usedSubstringExpansion = ref(
-    isRestoring ? globalUsedSubstringExpansion.value : false
-  )
   const resultLimit = ref(
     isRestoring ? globalResultLimit.value : RESULTS_PAGE_SIZE
   )
@@ -418,7 +414,6 @@ export function useSearchModal() {
     ([snapshot, filterTextValue]) => {
       if (snapshot === globalLastIndex && matchesGlobalState()) {
         queriedSnapshot = snapshot
-        usedSubstringExpansion.value = globalUsedSubstringExpansion.value
         allResults.value = globalAllResults.value
         enableNoResults.value = true
         return
@@ -441,12 +436,13 @@ export function useSearchModal() {
         return
       }
 
-      const { results: boostedResults, usedSubstringExpansion: expanded } =
-        snapshot.engine.search(filterTextValue, {
+      const { results: boostedResults } = snapshot.engine.search(
+        filterTextValue,
+        {
           fuzzy: isFuzzySearch.value,
           urls: isUrlSearch.value
-        })
-      usedSubstringExpansion.value = expanded
+        }
+      )
 
       enableNoResults.value = true
 
@@ -459,7 +455,6 @@ export function useSearchModal() {
       globalLastFuzzy.value = isFuzzySearch.value
       globalLastUrlSearch.value = isUrlSearch.value
       globalLastDetailed.value = showDetailedList.value
-      globalUsedSubstringExpansion.value = usedSubstringExpansion.value
     },
     { debounce: SEARCH_DEBOUNCE_MS, immediate: true }
   )
@@ -532,13 +527,17 @@ export function useSearchModal() {
 
       const terms = new Set<string>()
 
-      const isExactSearch = !fuzzy && !usedSubstringExpansion.value
+      const needsPhraseFiltering =
+        !fuzzy &&
+        scopedResults.some(
+          (result) => !result.substringMatched && !result.urlMatched
+        )
       // Exact phrase filtering needs a wider pool in both compact and detailed views.
       const candidateLimit = Math.max(MIN_CANDIDATE_POOL, limit * 2)
-      const candidates = isExactSearch
+      const candidates = needsPhraseFiltering
         ? scopedResults.slice(0, candidateLimit)
         : sliced
-      const includeExcerpts = isExactSearch || showDetailedListValue
+      const includeExcerpts = needsPhraseFiltering || showDetailedListValue
       const toFetch = includeExcerpts
         ? candidates.filter(
             (result) => !excerptCache.has(result.id.split('#')[0])
@@ -561,19 +560,23 @@ export function useSearchModal() {
           text: includeExcerpts ? lookupExcerptText(result.id) : ''
         }
       })
-      const filtered = isExactSearch ? filterResults(mapped, query) : mapped
-      const finalResults = isExactSearch ? filtered.slice(0, limit) : filtered
-      const totalCount = isExactSearch
+      const filtered = needsPhraseFiltering
+        ? filterResults(mapped, query)
+        : mapped
+      const finalResults = needsPhraseFiltering
+        ? filtered.slice(0, limit)
+        : filtered
+      const totalCount = needsPhraseFiltering
         ? filtered.length
         : mapped.length + Math.max(0, scopedResults.length - limit)
       // Expanding the limit also expands the pool of exact matches being checked.
       const mayHaveMoreValue =
-        isExactSearch && scopedResults.length > candidateLimit
+        needsPhraseFiltering && scopedResults.length > candidateLimit
 
       if (resultSetChanged) {
         // A category's preview filtering must not remove the other category chips.
         categoryCounts.value = computeCategoryCounts(
-          isExactSearch && !category ? filtered : allRes
+          needsPhraseFiltering && !category ? filtered : allRes
         )
       }
 
