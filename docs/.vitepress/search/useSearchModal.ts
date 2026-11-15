@@ -534,10 +534,9 @@ export function useSearchModal() {
         searchQuery.excludedSites.length > 0
       const needsContentFiltering =
         hasExclusions ||
-        searchQuery.branches.some(
-          (branch) => parseSearchQuery(branch).isPhrase
-        ) ||
-        searchQuery.isPhrase ||
+        searchQuery.sites.length > 0 ||
+        searchQuery.urls.length > 0 ||
+        searchQuery.phrases.length > 0 ||
         (!fuzzy &&
           (/\s/.test(searchQuery.text) ||
             scopedResults.some(
@@ -639,9 +638,14 @@ export function useSearchModal() {
       // the query text isn't in the visible link text. Highlight the specific
       // link(s) in the excerpt whose href matched the query.
       if (finalResults.some((r) => r.urlMatched)) {
-        const urlQuery = buildUrlQuery(searchQuery.text)
         for (const r of finalResults) {
-          if (!r.urlMatched || !urlQuery) continue
+          if (!r.urlMatched) continue
+          const urlQueries = (r.searchBranches ?? [query])
+            .map((branch) => parseSearchQuery(branch))
+            .filter((branch) => !branch.phrases.length)
+            .map((branch) => buildUrlQuery(branch.text))
+            .filter((value) => value !== null)
+          if (!urlQueries.length) continue
           const item = resultsEl.value?.querySelector(
             `[data-id="${CSS.escape(r.id)}"]`
           )
@@ -651,7 +655,9 @@ export function useSearchModal() {
           for (const anchor of anchors) {
             const href = anchor.getAttribute('href') ?? ''
             if (
-              !urlMatchesNormalizedUrl(normalizeUrlSearchValue(href), urlQuery)
+              !urlQueries.some((urlQuery) =>
+                urlMatchesNormalizedUrl(normalizeUrlSearchValue(href), urlQuery)
+              )
             )
               continue
             if (anchor.querySelector('mark[data-markjs="true"]')) continue

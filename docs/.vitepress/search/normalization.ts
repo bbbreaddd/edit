@@ -37,10 +37,18 @@ export function parseSearchQuery(value: string) {
     }
     targets[operator[1].toLowerCase()].push(unquote(operator[2]))
   }
+  const phrases = text
+    .filter((token) => /^".*"$|^“.*”$/.test(token))
+    .map((token) => unquote(token).replace(/\s+/g, ' ').trim())
+  const unquotedText = text
+    .filter((token) => !/^".*"$|^“.*”$/.test(token))
+    .join(' ')
   const trimmed = text.join(' ')
   const isPhrase = text.length === 1 && /^".*"$|^“.*”$/.test(trimmed)
   return {
-    text: (isPhrase ? unquote(trimmed) : trimmed).replace(/\s+/g, ' ').trim(),
+    text: text.map(unquote).join(' ').replace(/\s+/g, ' ').trim(),
+    phrases,
+    unquotedText,
     isPhrase,
     sites,
     excludedTerms,

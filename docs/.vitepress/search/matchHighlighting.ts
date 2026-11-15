@@ -116,7 +116,14 @@ export function formMarkRegex(
   rawQuery: string,
   fuzzy: boolean
 ): RegExp {
-  const { text: query, isPhrase, branches, titles } = parseSearchQuery(rawQuery)
+  const {
+    text: query,
+    isPhrase,
+    branches,
+    titles,
+    phrases,
+    unquotedText
+  } = parseSearchQuery(rawQuery)
   if (branches.length > 1) {
     return new RegExp(
       branches
@@ -126,15 +133,24 @@ export function formMarkRegex(
     )
   }
   if (isPhrase) return createPhraseRegex(query, true)
-  const allTerms = new Set([...terms].filter((term) => term !== rawQuery))
+  const quotedWords = new Set(
+    phrases.flatMap(tokenizeSearchText).map((word) => word.toLowerCase())
+  )
+  const allTerms = new Set(
+    [...terms].filter(
+      (term) => term !== rawQuery && !quotedWords.has(term.toLowerCase())
+    )
+  )
   for (const title of titles) allTerms.add(title)
   if (fuzzy && !isExplicitUrlQuery(query)) {
-    const words = tokenizeSearchText(query).filter(Boolean)
+    const words = tokenizeSearchText(
+      phrases.length ? unquotedText : query
+    ).filter(Boolean)
     for (const word of words) {
       allTerms.add(word)
     }
   } else {
-    const trimmed = query
+    const trimmed = phrases.length ? unquotedText : query
     allTerms.add(trimmed)
     if (isExplicitUrlQuery(query)) {
       const stripped = stripSchemeAndWww(normalizeUrlSearchValue(trimmed))
@@ -143,13 +159,15 @@ export function formMarkRegex(
       }
     }
   }
-  if (![...allTerms].some(Boolean)) return /(?!)/g
+  if (!phrases.length && ![...allTerms].some(Boolean)) return /(?!)/g
   return new RegExp(
-    [...allTerms]
-      .filter(Boolean)
-      .sort((a, b) => b.length - a.length)
-      .map((term) => `(${escapeRegExp(term)})`)
-      .join('|'),
-    'gi'
+    [
+      ...phrases.map((phrase) => `(?:${createPhraseRegex(phrase).source})`),
+      ...[...allTerms]
+        .filter(Boolean)
+        .sort((a, b) => b.length - a.length)
+        .map((term) => `(${escapeRegExp(term)})`)
+    ].join('|'),
+    'giu'
   )
 }

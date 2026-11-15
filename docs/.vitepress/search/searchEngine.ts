@@ -147,11 +147,16 @@ export function mergeSearchMatches(
 
 function createRemainingMatcher(query: Query, options: SearchOptions) {
   let validator: MiniSearch<{ id: number; text: string }> | undefined
-  return (result: LocalSearchResult, removed: ReadonlySet<string>) => {
+  return (
+    result: LocalSearchResult,
+    removed: ReadonlySet<string>,
+    includeHeadings = true
+  ) => {
     const terms = result.terms.filter(
       (term) =>
         !removed.has(term) ||
-        result.match[term]?.some((field) => field !== 'text')
+        (includeHeadings &&
+          result.match[term]?.some((field) => field !== 'text'))
     )
     if (terms.length === result.terms.length) return true
     if (!terms.length) return false
@@ -333,7 +338,12 @@ function runSearch(
   }
 
   const matchesWithoutTerms =
-    fuzzy && (parsed.excludedTerms.length || parsed.excludedSites.length)
+    fuzzy &&
+    (parsed.excludedTerms.length ||
+      parsed.excludedSites.length ||
+      sites.length ||
+      urls.length ||
+      parsed.phrases.length)
       ? createRemainingMatcher(query, searchOptions)
       : undefined
   const queryLooksLikeUrl = !isPhrase && isExplicitUrlQuery(filterTextValue)
@@ -528,7 +538,8 @@ function runSearch(
       ...r,
       matchesWithoutTerms:
         matchesWithoutTerms && Object.keys(r.match).length
-          ? (removed: ReadonlySet<string>) => matchesWithoutTerms(r, removed)
+          ? (removed: ReadonlySet<string>, includeHeadings?: boolean) =>
+              matchesWithoutTerms(r, removed, includeHeadings)
           : undefined,
       hasStarredExact,
       hasExact,

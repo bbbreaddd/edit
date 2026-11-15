@@ -347,20 +347,6 @@ function filterQueryResults(
           }
         }
       )
-      if (
-        !parsed.sites.every((site) => {
-          const matchesHost = createSiteMatcher(site)
-          return matchesHost && links.some((link) => matchesHost(link.hostname))
-        }) ||
-        !urlFilters.every((filter) =>
-          links.some((link) =>
-            normalizeSearchUrl(normalizeUrlSearchValue(link.href)).includes(
-              filter
-            )
-          )
-        )
-      )
-        return []
       const urlQuery = buildUrlQuery(query)
       const urlMatched =
         !!result.urlMatched &&
@@ -379,36 +365,112 @@ function filterQueryResults(
       return [{ ...result, urlMatched, text: template.innerHTML }]
     })
   }
-  if (!query) return { results: isPhrase ? [] : results, excludedEntries }
-  if (fuzzy && !isPhrase) return { results, excludedEntries }
-  const multiword = /\s/.test(query)
-  const template =
-    multiword || isPhrase ? document.createElement('template') : null
-  const clean = (html: string) => {
-    if (!template) return normalizeText(html.replace(/<[^>]*>/g, ' '))
-    template.innerHTML = html
-    return normalizeText(template.content.textContent ?? '')
+  const hasEntryFilters = parsed.sites.length > 0 || urlFilters.length > 0
+  if (!query && !hasEntryFilters)
+    return { results: isPhrase ? [] : results, excludedEntries }
+  if (fuzzy && !parsed.phrases.length && !hasEntryFilters)
+    return { results, excludedEntries }
+
+  const template = document.createElement('template')
+  const phrasePatterns = parsed.phrases.map((phrase) =>
+    createPhraseRegex(normalizeText(phrase))
+  )
+  const matchesText = (
+    text: string,
+    result: LocalSearchResult,
+    indexedText = text
+  ) => {
+    text = normalizeText(text)
+    if (!phrasePatterns.every((pattern) => pattern.test(text))) return false
+    if (!query || isPhrase) return true
+    if (fuzzy) {
+      if (!hasEntryFilters) return true
+      const present = new Set(tokenizeIndexLike(indexedText, true))
+      return !!result.matchesWithoutTerms?.(
+        new Set(result.terms.filter((term) => !present.has(term))),
+        false
+      )
+    }
+    return parsed.phrases.length
+      ? parsed.unquotedText
+          .split(/\s+/)
+          .every((word) => text.includes(normalizeText(word)))
+      : text.includes(normalizeText(query))
   }
-  const phrase = clean(query)
-  const phrasePattern = isPhrase ? createPhraseRegex(phrase) : null
-  const matchesPhrase = (text: string) =>
-    phrasePattern ? phrasePattern.test(text) : text.includes(phrase)
+  const clean = (html: string) => {
+    template.innerHTML = html
+    return template.content.textContent ?? ''
+  }
 
   return {
     results: results.filter((result) => {
+      const cached = lookupExcerpt(result.id)
+      const html = result.text || cached?.html
+      if (hasEntryFilters) {
+        if (!html) return false
+        template.innerHTML = html
+        const entries = [
+          ...template.content.querySelectorAll(SEARCH_ENTRY_SELECTOR)
+        ]
+        const urlQuery =
+          result.urlMatched && query ? buildUrlQuery(query) : null
+        return (entries.length ? entries : [template.content]).some((entry) => {
+          const own = entry.cloneNode(true) as Element | DocumentFragment
+          own.querySelectorAll('ul, ol').forEach((list) => list.remove())
+          const links = [...own.querySelectorAll('a[href]')].flatMap((link) => {
+            try {
+              return [new URL(link.getAttribute('href')!, 'https://fmhy.net')]
+            } catch {
+              return []
+            }
+          })
+          if (
+            !parsed.sites.every((site) => {
+              const matchesHost = createSiteMatcher(site)
+              return (
+                matchesHost && links.some((link) => matchesHost(link.hostname))
+              )
+            }) ||
+            !urlFilters.every((filter) =>
+              links.some((link) =>
+                normalizeSearchUrl(normalizeUrlSearchValue(link.href)).includes(
+                  filter
+                )
+              )
+            )
+          )
+            return false
+          const text = own.textContent ?? ''
+          // Platform names may be rendered as icons rather than visible text.
+          const indexedText = fuzzy
+            ? [
+                text,
+                ...[...own.querySelectorAll('[alt]')].map(
+                  (icon) => icon.getAttribute('alt') ?? ''
+                )
+              ].join(' ')
+            : text
+          return (
+            matchesText(text, result, indexedText) ||
+            (!!urlQuery &&
+              links.some((link) =>
+                urlMatchesNormalizedUrl(
+                  normalizeUrlSearchValue(link.href),
+                  urlQuery
+                )
+              ))
+          )
+        })
+      }
       if (
         !isPhrase &&
-        !multiword &&
+        !/\s/.test(query) &&
         (result.urlMatched || (!hasExclusions && result.substringMatched))
       )
         return true
       const headings = [result.title, ...result.titles].map(clean)
-      if (headings.some(matchesPhrase)) return true
-
-      const cached = lookupExcerpt(result.id)
-      const html = result.text || cached?.html
+      if (headings.some((heading) => matchesText(heading, result))) return true
       if (!html) return allowMissingText
-      if (!template) return clean(html).includes(phrase)
 
       let blocks = cached?.html === html ? cached.blocks : undefined
       if (!blocks) {
@@ -416,7 +478,7 @@ function filterQueryResults(
         blocks = collectSearchBlocks(template.content)
         if (cached?.html === html) cached.blocks = blocks
       }
-      return blocks.some(matchesPhrase)
+      return blocks.some((block) => matchesText(block, result))
     }),
     excludedEntries
   }
