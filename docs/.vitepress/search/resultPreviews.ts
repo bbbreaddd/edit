@@ -1,26 +1,25 @@
+import type { useData } from 'vitepress/dist/client/theme-default/composables/data'
 import type { Component, Slots } from 'vue'
 import type { LocalSearchResult } from './types'
 import { dataSymbol } from 'vitepress'
 import { pathToFile } from 'vitepress/dist/client/app/utils'
-import { useData } from 'vitepress/dist/client/theme-default/composables/data'
 import { createApp, h } from 'vue'
 import CriticalBadge from '../theme/components/CriticalBadge.vue'
 import Tooltip from '../theme/components/Tooltip.vue'
 import { INVISIBLE_CHARS_RE } from './normalization'
 
 export const excerptCache = new Map<string, Map<string, string>>()
-const cache = excerptCache
 
 export function lookupExcerptText(resultId: string): string {
   const hashIndex = resultId.indexOf('#')
   if (hashIndex === -1) return ''
   const pageId = resultId.slice(0, hashIndex)
-  const map = cache.get(pageId)
+  const map = excerptCache.get(pageId)
   if (!map) return ''
   const anchor = resultId.slice(hashIndex + 1)
   const direct = map.get(anchor)
   if (direct) return direct
-  // The search index (constants.ts) and the excerpt DOM derive heading slugs
+  // The search index (buildSearchIndex.ts) and the excerpt DOM derive heading slugs
   // from two separate render passes that can disagree: e.g. an emoji in a
   // heading is dropped from the index slug ("stars-added") but baked into the
   // mounted component's slug ("stars-added-⭐"). Recover by matching the index
@@ -71,9 +70,9 @@ export async function processExcerpts(
     if (isCanceled()) return
     const hashIndex = id.indexOf('#')
     const mapId = hashIndex === -1 ? id : id.slice(0, hashIndex)
-    if (cache.has(mapId)) continue
+    if (excerptCache.has(mapId)) continue
     const map = new Map<string, string>()
-    const comp = (mod.default ?? mod) as { render?: unknown; setup?: unknown }
+    const comp = (mod.default ?? mod) as ComponentModule
     if (comp && typeof comp === 'object' && (comp.render || comp.setup)) {
       try {
         const app = createApp(comp as Component)
@@ -113,7 +112,7 @@ export async function processExcerpts(
               // Skip note/infobox custom blocks (:::tip/:::info/:::warning/
               // :::danger) so the excerpt highlights the real curated link
               // instead of a note that merely mentions the query. Mirrors the
-              // index-time strip in constants.ts so preview and ranking agree.
+              // index-time strip in buildSearchIndex.ts so preview and ranking agree.
               const cls = next.classList
               const isNoteBlock =
                 cls.contains('custom-block') &&
@@ -126,7 +125,7 @@ export async function processExcerpts(
             }
             map.set(anchor, html)
           })
-          cache.set(mapId, map)
+          excerptCache.set(mapId, map)
         } finally {
           app.unmount()
         }

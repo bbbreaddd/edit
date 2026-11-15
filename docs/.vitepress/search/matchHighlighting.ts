@@ -111,10 +111,7 @@ export function formMarkRegex(
   rawQuery: string,
   fuzzy: boolean
 ) {
-  const allTerms = new Set<string>()
-  for (const term of terms) {
-    allTerms.add(term)
-  }
+  const allTerms = new Set(terms)
   if (fuzzy && !looksLikeUrlQuery(rawQuery)) {
     const words = rawQuery
       .trim()

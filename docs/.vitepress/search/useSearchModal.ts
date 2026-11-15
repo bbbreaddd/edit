@@ -1,5 +1,4 @@
 import type { ModalTranslations } from 'vitepress/types/local-search'
-import type { Ref } from 'vue'
 import type { LocalSearchResult, SidebarItem } from './types'
 import localSearchIndex from '@localSearchIndex'
 import {
@@ -29,10 +28,6 @@ import {
   watchEffect
 } from 'vue'
 import { sidebar } from '../shared'
-import {
-  sanitizeRichHtml,
-  sanitizeSearchHtml
-} from '../theme/composables/sanitize'
 import {
   formMarkRegex,
   getRelativeOffsetTop,
@@ -82,8 +77,6 @@ const globalLastDetailed = ref(false)
 const globalResults = ref<LocalSearchResult[]>([])
 const globalAllResults = ref<LocalSearchResult[]>([])
 const globalTotalResultsCount = ref(0)
-const globalResultMarks = ref<Map<number, HTMLElement[][]>>(new Map())
-const globalCurrentMarkIndex = ref<Map<number, number>>(new Map())
 const globalResultLimit = ref(RESULTS_PAGE_SIZE)
 const globalUsedSubstringExpansion = ref(false)
 const globalMayHaveMore = ref(false)
@@ -137,9 +130,7 @@ export function useSearchModal() {
     return counts
   }
 
-  // Categories and labels come from the sidebar, which is static at build time,
-  // so this runs once. Wiki and Tools entries pointing at the same page
-  // (e.g. /audio#audio-tools) keep the first (Wiki) label.
+  // Wiki and Tools entries can target the same page; keep the first label.
   const searchCategories = (() => {
     const entries: { id: string; label: string }[] = []
     const seen = new Set<string>()
@@ -165,9 +156,7 @@ export function useSearchModal() {
 
   const activeCategory = ref('')
 
-  // Chips count what's actually displayed (after excerpt filtering in
-  // detailed view), not the raw pool. Rebuilt in watcher 2 when the
-  // underlying result set changes.
+  // Preserve the other categories' counts when one category is selected.
   const categoryCounts = shallowRef<Map<string, number>>(new Map())
 
   const totalCategoryCount = computed(() =>
@@ -307,19 +296,15 @@ export function useSearchModal() {
 
   const isRestoring = matchesGlobalState()
 
-  const results: Ref<LocalSearchResult[]> = shallowRef(
+  const results = shallowRef<LocalSearchResult[]>(
     isRestoring ? globalResults.value : []
   )
   const allResults = shallowRef<LocalSearchResult[]>(
     isRestoring ? globalAllResults.value : []
   )
   const totalResultsCount = ref(isRestoring ? globalTotalResultsCount.value : 0)
-  const resultMarks = shallowRef<Map<number, HTMLElement[][]>>(
-    isRestoring ? new Map(globalResultMarks.value) : new Map()
-  )
-  const currentMarkIndex = shallowRef<Map<number, number>>(
-    isRestoring ? new Map(globalCurrentMarkIndex.value) : new Map()
-  )
+  const resultMarks = shallowRef(new Map<number, HTMLElement[][]>())
+  const currentMarkIndex = shallowRef(new Map<number, number>())
 
   const enableNoResults = ref(isRestoring)
   const isSearching = ref(!isRestoring && !!filterText.value)
@@ -352,12 +337,6 @@ export function useSearchModal() {
     shouldResetScroll.value = true
   })
 
-  const cache = excerptCache
-
-  /**
-   * Main search handler - debounced to avoid excessive re-renders while typing.
-   * Watches: search index, filter text, detail view toggle, and fuzzy search mode.
-   */
   watch(
     [filterText, isFuzzySearch, isUrlSearch, showDetailedList, activeSnapshot],
     () => {
@@ -370,7 +349,7 @@ export function useSearchModal() {
   watch(
     [searchIndexSource, localeIndex],
     () => {
-      cache.clear()
+      excerptCache.clear()
       allResults.value = []
       results.value = []
       resultMarks.value = new Map()
@@ -386,9 +365,12 @@ export function useSearchModal() {
     { flush: 'sync' }
   )
 
-  watch(activeSnapshot, () => cache.clear(), { immediate: true, flush: 'sync' })
+  watch(activeSnapshot, () => excerptCache.clear(), {
+    immediate: true,
+    flush: 'sync'
+  })
 
-  // 1. Debounced Search watcher: Only runs the index query and gets the raw matching results list
+  // Query the index after typing pauses; pagination and previews are handled below.
   watchDebounced(
     () =>
       [
@@ -398,7 +380,7 @@ export function useSearchModal() {
         isUrlSearch.value,
         showDetailedList.value
       ] as const,
-    async ([snapshot, filterTextValue], old, onCleanup) => {
+    ([snapshot, filterTextValue], old) => {
       const snapshotChanged = old && old[0] !== undefined && old[0] !== snapshot
       if (!snapshotChanged && matchesGlobalState()) {
         queriedSnapshot = snapshot
@@ -407,11 +389,6 @@ export function useSearchModal() {
         enableNoResults.value = true
         return
       }
-
-      let canceled = false
-      onCleanup(() => {
-        canceled = true
-      })
 
       globalLastIndex = null
       queriedSnapshot = null
@@ -426,8 +403,6 @@ export function useSearchModal() {
         globalTotalResultsCount.value = 0
         globalLastQuery.value = ''
         globalResults.value = []
-        globalResultMarks.value = new Map()
-        globalCurrentMarkIndex.value = new Map()
         globalMayHaveMore.value = false
         return
       }
@@ -441,11 +416,10 @@ export function useSearchModal() {
 
       enableNoResults.value = true
 
-      if (canceled) return
       queriedSnapshot = snapshot
       allResults.value = boostedResults
 
-      // Save to global cache (totalResultsCount is set by watcher 2 after excerpt filtering)
+      // Cache raw query results; the preview watcher updates the displayed count.
       globalAllResults.value = boostedResults
       globalLastQuery.value = filterTextValue
       globalLastFuzzy.value = isFuzzySearch.value
@@ -456,7 +430,7 @@ export function useSearchModal() {
     { debounce: SEARCH_DEBOUNCE_MS, immediate: true }
   )
 
-  // 2. Synchronous Watcher: Handles slicing, excerpt fetching, DOM rendering, and highlight marking instantly
+  // Prepare the current result page and highlights without rerunning the index query.
   watch(
     () =>
       [
@@ -524,87 +498,48 @@ export function useSearchModal() {
 
       const terms = new Set<string>()
 
-      const mapResult = (r: LocalSearchResult, text: string) => {
-        if (fuzzy) {
-          for (const term of Object.keys(r.match || {})) {
-            terms.add(term)
-          }
-        }
-        return { ...r, text }
-      }
-
-      let finalResults: LocalSearchResult[]
-      let totalCount: number
-      let mayHaveMoreValue = false
-      // Only the exact + detailed branch sets this, after excerpt filtering.
-      // Null = the raw pool is what's shown, so chips count from allRes.
-      let postFiltered: LocalSearchResult[] | null = null
-
       const isExactSearch = !fuzzy && !usedSubstringExpansion.value
+      // Exact phrase filtering needs a wider pool in both compact and detailed views.
+      const candidateLimit = Math.max(MIN_CANDIDATE_POOL, limit * 2)
+      const candidates = isExactSearch
+        ? scopedResults.slice(0, candidateLimit)
+        : sliced
+      const includeExcerpts = isExactSearch || showDetailedListValue
+      const toFetch = includeExcerpts
+        ? candidates.filter(
+            (result) => !excerptCache.has(result.id.split('#')[0])
+          )
+        : []
+      const mods = await Promise.all(
+        toFetch.map((result) => fetchExcerpt(result.id))
+      )
+      if (isCanceled()) return
 
-      if (isExactSearch) {
-        // Exact mode now runs in both views. We fetch a dynamic candidate pool
-        // so contiguous phrase matches don't get ranked away, and the list (and
-        // chips) look the same in compact and detailed.
-        const candidateLimit = Math.max(MIN_CANDIDATE_POOL, limit * 2)
-        const candidates = scopedResults.slice(0, candidateLimit)
+      await processExcerpts(mods, vitePressData, isCanceled)
+      if (isCanceled()) return
 
-        const candidatesToFetch = candidates.filter((r) => {
-          const [id] = r.id.split('#')
-          return !cache.has(id)
-        })
-        const mods = await Promise.all(
-          candidatesToFetch.map((r) => fetchExcerpt(r.id))
-        )
-        if (isCanceled()) return
-
-        await processExcerpts(mods, vitePressData, isCanceled)
-        if (isCanceled()) return
-
-        const mapped = candidates.map((r) => {
-          const text = lookupExcerptText(r.id)
-          return mapResult(r, text)
-        })
-
-        const filtered = filterResults(mapped, query)
-        postFiltered = filtered
-        finalResults = filtered.slice(0, limit)
-        totalCount = filtered.length
-        // Untested remainder beyond the candidate pool may contain more matches;
-        // expanding resultLimit re-runs this branch with a larger candidateLimit.
-        mayHaveMoreValue = scopedResults.length > candidateLimit
-      } else {
-        // Fuzzy search or substring expansion: slice to limit directly
-        const slicedToFetch = showDetailedListValue
-          ? sliced.filter((r) => {
-              const [id] = r.id.split('#')
-              return !cache.has(id)
-            })
-          : []
-        const mods = await Promise.all(
-          slicedToFetch.map((r) => fetchExcerpt(r.id))
-        )
-        if (isCanceled()) return
-
-        await processExcerpts(mods, vitePressData, isCanceled)
-        if (isCanceled()) return
-
-        const mapped = sliced.map((r) => {
-          const text = showDetailedListValue ? lookupExcerptText(r.id) : ''
-          return mapResult(r, text)
-        })
-
-        finalResults = mapped
-        totalCount = mapped.length + Math.max(0, scopedResults.length - limit)
-      }
+      const mapped = candidates.map((result) => {
+        if (fuzzy) {
+          for (const term of Object.keys(result.match || {})) terms.add(term)
+        }
+        return {
+          ...result,
+          text: includeExcerpts ? lookupExcerptText(result.id) : ''
+        }
+      })
+      const filtered = isExactSearch ? filterResults(mapped, query) : mapped
+      const finalResults = isExactSearch ? filtered.slice(0, limit) : filtered
+      const totalCount = isExactSearch
+        ? filtered.length
+        : mapped.length + Math.max(0, scopedResults.length - limit)
+      // Expanding the limit also expands the pool of exact matches being checked.
+      const mayHaveMoreValue =
+        isExactSearch && scopedResults.length > candidateLimit
 
       if (resultSetChanged) {
-        // Category active = excerpt filter only covers that category, so count
-        // the raw pool or the other chips disappear and you can't switch back.
-        // Without a category, the post filtered set is what's shown (fuzzy/compact
-        // don't filter, so allRes is it).
+        // A category's preview filtering must not remove the other category chips.
         categoryCounts.value = computeCategoryCounts(
-          postFiltered && !category ? postFiltered : allRes
+          isExactSearch && !category ? filtered : allRes
         )
       }
 
@@ -732,101 +667,42 @@ export function useSearchModal() {
       globalLastIndex = { source: snapshot.source, locale: snapshot.locale }
       globalResults.value = finalResults
       globalTotalResultsCount.value = totalCount
-      globalResultMarks.value = resultMarks.value
-      globalCurrentMarkIndex.value = currentMarkIndex.value
       globalResultLimit.value = limit
       globalMayHaveMore.value = mayHaveMoreValue
     },
     { immediate: true }
   )
 
-  /**
-   * Merges adjacent highlight marks that are visually close together.
-   * This reduces the number of navigation stops in fuzzy mode where
-   * each individual word match would otherwise be a separate highlight.
-   *
-   * Merging criteria (tuned via constants at top of file):
-   * - Marks must be on the same line (within MARK_SAME_LINE_THRESHOLD_PX)
-   * - Marks must be close horizontally (< MARK_MERGE_DISTANCE_PX)
-   */
-  /**
-   * Custom feature: Navigate to the next highlighted match in the current result.
-   * Cycles back to the first match when reaching the end.
-   * Smoothly scrolls the excerpt to center the highlighted match.
-   */
-  function nextMatch(index: number) {
-    if (selectedIndex.value !== index) {
-      selectedIndex.value = index
-    }
+  function cycleMatch(index: number, direction: 1 | -1) {
+    if (selectedIndex.value !== index) selectedIndex.value = index
     const marks = resultMarks.value.get(index)
-    let curr = currentMarkIndex.value.get(index) ?? 0
     if (!marks) return
+    const current = currentMarkIndex.value.get(index) ?? 0
+    marks[current]?.forEach((mark) => mark.classList.remove('current'))
 
-    // Remove 'current' class from previous group of marks
-    marks[curr]?.forEach((m) => m.classList.remove('current'))
-
-    curr = (curr + 1) % marks.length
-    currentMarkIndex.value.set(index, curr)
+    const next = (current + direction + marks.length) % marks.length
+    currentMarkIndex.value.set(index, next)
     triggerRef(currentMarkIndex)
 
-    // Add 'current' class to new group of marks
-    const newGroup = marks[curr]
-    if (newGroup && newGroup.length > 0) {
-      newGroup.forEach((m) => m.classList.add('current'))
-      const newMark = newGroup[0]
-      const excerpt = newMark.closest<HTMLElement>('.excerpt')
-      if (excerpt) {
-        const markRelTop = getRelativeOffsetTop(newMark, excerpt)
-        excerpt.scrollTo({
-          top: markRelTop - excerpt.clientHeight / 2 + newMark.offsetHeight / 2,
-          behavior: 'smooth'
-        })
-      }
-    }
-  }
-
-  /**
-   * Custom feature: Navigate to the previous highlighted match in the current result.
-   * Cycles to the last match when going before the first.
-   * Smoothly scrolls the excerpt to center the highlighted match.
-   */
-  function prevMatch(index: number) {
-    if (selectedIndex.value !== index) {
-      selectedIndex.value = index
-    }
-    const marks = resultMarks.value.get(index)
-    let curr = currentMarkIndex.value.get(index) ?? 0
-    if (!marks) return
-
-    // Remove 'current' class from previous group of marks
-    marks[curr]?.forEach((m) => m.classList.remove('current'))
-
-    curr = (curr - 1 + marks.length) % marks.length
-    currentMarkIndex.value.set(index, curr)
-    triggerRef(currentMarkIndex)
-
-    // Add 'current' class to new group of marks
-    const newGroup = marks[curr]
-    if (newGroup && newGroup.length > 0) {
-      newGroup.forEach((m) => m.classList.add('current'))
-      const newMark = newGroup[0]
-      const excerpt = newMark.closest<HTMLElement>('.excerpt')
-      if (excerpt) {
-        const markRelTop = getRelativeOffsetTop(newMark, excerpt)
-        excerpt.scrollTo({
-          top: markRelTop - excerpt.clientHeight / 2 + newMark.offsetHeight / 2,
-          behavior: 'smooth'
-        })
-      }
+    const group = marks[next]
+    if (!group?.length) return
+    group.forEach((mark) => mark.classList.add('current'))
+    const mark = group[0]
+    const excerpt = mark.closest<HTMLElement>('.excerpt')
+    if (excerpt) {
+      excerpt.scrollTo({
+        top:
+          getRelativeOffsetTop(mark, excerpt) -
+          excerpt.clientHeight / 2 +
+          mark.offsetHeight / 2,
+        behavior: 'smooth'
+      })
     }
   }
 
   /* Search input focus */
 
   const searchInput = ref<HTMLInputElement>()
-  const disableReset = computed(() => {
-    return !filterText.value
-  })
   function focusSearchInput(select = true) {
     searchInput.value?.focus()
     if (select) {
@@ -1038,7 +914,7 @@ export function useSearchModal() {
       (resultMarks.value.get(targetIndex)?.length ?? 0) > 0
     ) {
       event.preventDefault()
-      prevMatch(targetIndex)
+      cycleMatch(targetIndex, -1)
     }
   })
 
@@ -1071,7 +947,7 @@ export function useSearchModal() {
       (resultMarks.value.get(targetIndex)?.length ?? 0) > 0
     ) {
       event.preventDefault()
-      nextMatch(targetIndex)
+      cycleMatch(targetIndex, 1)
     }
   })
 
@@ -1132,8 +1008,6 @@ export function useSearchModal() {
     isLocked.value = false
     resultMarks.value = new Map()
     currentMarkIndex.value = new Map()
-    globalResultMarks.value = new Map()
-    globalCurrentMarkIndex.value = new Map()
   })
 
   function addRecentSearch(query: string) {
@@ -1192,20 +1066,8 @@ export function useSearchModal() {
     nextTick().then(() => focusSearchInput(false))
   }
 
-  function toggleDetailedList() {
-    showDetailedList.value = !showDetailedList.value
-  }
-
   function handleInput(e: Event) {
     filterText.value = (e.target as HTMLInputElement).value
-  }
-
-  function toggleFuzzySearch() {
-    isFuzzySearch.value = !isFuzzySearch.value
-  }
-
-  function toggleUrlSearch() {
-    isUrlSearch.value = !isUrlSearch.value
   }
 
   let lastMouseX = 0
@@ -1271,10 +1133,8 @@ export function useSearchModal() {
     mayHaveMore,
     recentSearches,
     autoSuggestions,
-    nextMatch,
-    prevMatch,
+    cycleMatch,
     searchInput,
-    disableReset,
     applySuggestion,
     onSearchBarClick,
     selectedIndex,
@@ -1285,13 +1145,8 @@ export function useSearchModal() {
     clearAllRecentSearches,
     handleResultClick,
     resetSearch,
-    toggleDetailedList,
     handleInput,
-    toggleFuzzySearch,
-    toggleUrlSearch,
     onMouseMove,
-    onResultsKeydown,
-    sanitizeRichHtml,
-    sanitizeSearchHtml
+    onResultsKeydown
   }
 }

@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { useSearchModal } from '../../search/useSearchModal'
+import { sanitizeRichHtml, sanitizeSearchHtml } from '../composables/sanitize'
 
 defineEmits<{ (e: 'close'): void }>()
 const {
@@ -32,10 +33,8 @@ const {
   mayHaveMore,
   recentSearches,
   autoSuggestions,
-  nextMatch,
-  prevMatch,
+  cycleMatch,
   searchInput,
-  disableReset,
   applySuggestion,
   onSearchBarClick,
   selectedIndex,
@@ -46,14 +45,9 @@ const {
   clearAllRecentSearches,
   handleResultClick,
   resetSearch,
-  toggleDetailedList,
   handleInput,
-  toggleFuzzySearch,
-  toggleUrlSearch,
   onMouseMove,
-  onResultsKeydown,
-  sanitizeRichHtml,
-  sanitizeSearchHtml
+  onResultsKeydown
 } = useSearchModal()
 </script>
 
@@ -141,7 +135,7 @@ const {
                 :title="
                   isFuzzySearch ? customTitles.fuzzyOn : customTitles.fuzzyOff
                 "
-                @click="toggleFuzzySearch"
+                @click="isFuzzySearch = !isFuzzySearch"
               >
                 <span v-if="isFuzzySearch" class="fuzzy-icon">~</span>
                 <span v-else class="exact-icon">=</span>
@@ -169,7 +163,7 @@ const {
                       ? customTitles.urlAuto
                       : customTitles.urlOff
                 "
-                @click="toggleUrlSearch"
+                @click="isUrlSearch = !isUrlSearch"
               >
                 <span class="url-icon i-lucide:link" />
                 <span class="visually-hidden">
@@ -186,7 +180,7 @@ const {
               <button
                 class="clear-button"
                 type="reset"
-                :disabled="disableReset"
+                :disabled="!filterText"
                 :title="translate('modal.resetButtonTitle')"
                 @click="resetSearch"
               >
@@ -207,7 +201,7 @@ const {
               :class="{ 'detailed-list': showDetailedList }"
               :aria-pressed="showDetailedList"
               :title="translate('modal.displayDetails')"
-              @click="toggleDetailedList"
+              @click="showDetailedList = !showDetailedList"
             >
               <span class="vpi-layout-list toggle-layout-icon" />
               <span class="toggle-layout-label">
@@ -324,7 +318,7 @@ const {
                             type="button"
                             class="match-nav-button"
                             :title="customTitles.prevMatch"
-                            @click.stop.prevent="prevMatch(index)"
+                            @click.stop.prevent="cycleMatch(index, -1)"
                           >
                             <span class="vpi-chevron-left navigate-icon" />
                           </button>
@@ -337,7 +331,7 @@ const {
                             type="button"
                             class="match-nav-button"
                             :title="customTitles.nextMatch"
-                            @click.stop.prevent="nextMatch(index)"
+                            @click.stop.prevent="cycleMatch(index, 1)"
                           >
                             <span class="vpi-chevron-right navigate-icon" />
                           </button>
