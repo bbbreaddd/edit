@@ -302,12 +302,43 @@ function runSearch(
 function suggestSearch(
   index: MiniSearch<Result>,
   text: string,
-  links: ReturnType<typeof collectLinkTerms>
+  links: ReturnType<typeof collectLinkTerms>,
+  indexedTerms: Set<string>
 ): string[] {
   const query = text.trim()
-  if (/\s/.test(query)) return []
+  if (!query) return []
 
   try {
+    const words = query.split(/\s+/)
+    if (words.length > 1) {
+      const suggestions = new Set<string>()
+      for (const [i, word] of words.entries()) {
+        if (tokenizeIndexLike(word).every((term) => indexedTerms.has(term)))
+          continue
+        for (const replacement of suggestSearch(
+          index,
+          word,
+          links,
+          indexedTerms
+        )) {
+          const corrected = [...words]
+          corrected[i] = replacement
+          const suggestion = corrected.join(' ')
+          if (
+            index.search(suggestion, {
+              combineWith: 'AND',
+              fuzzy: false,
+              prefix: false
+            }).length > 0
+          ) {
+            suggestions.add(suggestion)
+            if (suggestions.size === MAX_SUGGESTIONS) return [...suggestions]
+          }
+        }
+      }
+      return [...suggestions]
+    }
+
     const rawSuggestions = index.autoSuggest(query, {
       fuzzy: (term) => (term.length >= 5 ? 2 : 1),
       prefix: true
@@ -384,6 +415,7 @@ export function createSearchEngine(
   const phraseTokens = new Map<string, Set<string>>()
   let urlIndex: UrlRecord[] | undefined
   let links: ReturnType<typeof collectLinkTerms> | undefined
+  let indexedTerms: Set<string> | undefined
   return {
     search(query: string, options: { fuzzy: boolean; urls: boolean }) {
       return runSearch(
@@ -398,7 +430,12 @@ export function createSearchEngine(
       )
     },
     suggest(query: string) {
-      return suggestSearch(index, query, (links ??= collectLinkTerms(metadata)))
+      return suggestSearch(
+        index,
+        query,
+        (links ??= collectLinkTerms(metadata)),
+        (indexedTerms ??= new Set(terms))
+      )
     }
   }
 }
