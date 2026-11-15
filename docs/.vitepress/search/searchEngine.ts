@@ -53,10 +53,12 @@ function findPageTitle(items: SidebarItem[], path: string): string | null {
 function collectLinkTerms(customMetadata: SearchMetadata) {
   const globalStarredLinks = new Set<string>()
   const globalLinks = new Set<string>()
+  const globalLinkPhrases = new Set<string>()
   for (const key in customMetadata) {
     const item = customMetadata[key]
     if (item.s) {
       for (const phrase of item.s) {
+        globalLinkPhrases.add(phrase)
         for (const w of tokenizeIndexLike(phrase, true)) {
           globalStarredLinks.add(w)
         }
@@ -64,13 +66,14 @@ function collectLinkTerms(customMetadata: SearchMetadata) {
     }
     if (item.l) {
       for (const phrase of item.l) {
+        globalLinkPhrases.add(phrase)
         for (const w of tokenizeIndexLike(phrase, true)) {
           globalLinks.add(w)
         }
       }
     }
   }
-  return { globalStarredLinks, globalLinks }
+  return { globalStarredLinks, globalLinks, globalLinkPhrases }
 }
 
 function fuzzyTolerance(term: string) {
@@ -90,6 +93,7 @@ function createTermLookup(terms: string[]) {
   }
   return {
     indexedTerms,
+    aliases,
     alternatives(word: string) {
       const tokens = tokenizeIndexLike(word)
       if (tokens.length !== 1) return []
@@ -393,6 +397,7 @@ function runSearch(
         )
       : undefined
 
+  const headingPattern = singleTerms.length === 1 ? createPhraseRegex(q) : null
   const boostedResults = currentResults.map((r) => {
     const meta = metadata[r.id]
     let hasStarredExact = false
@@ -461,12 +466,18 @@ function runSearch(
       hasStarredUrl,
       hasLinkWord,
       hasLinkUrl,
+      hasHeadingMatch:
+        !!headingPattern &&
+        // Sidebar labels are display context; use the indexed heading hierarchy.
+        [
+          r.title,
+          ...((index.getStoredFields(r.id) as Result | undefined)?.titles ?? [])
+        ].some((title) => headingPattern.test(title)),
       isRecentlyRemoved: /^\/recently-removed(?:\.html)?(?:#|$)/.test(r.id)
     }
   })
 
   const tierKeys: (keyof BoostFlags)[] = [
-    'hasStarredExact',
     'hasExact',
     'hasStarredPrefix',
     'hasPrefix',
@@ -482,6 +493,11 @@ function runSearch(
         Number(directMatches.has(b.id)) - Number(directMatches.has(a.id))
       if (difference) return difference
     }
+    // Retain exact starred names, then prefer headings over ordinary cross-references.
+    if (a.hasStarredExact !== b.hasStarredExact)
+      return a.hasStarredExact ? -1 : 1
+    if (a.hasHeadingMatch !== b.hasHeadingMatch)
+      return a.hasHeadingMatch ? -1 : 1
     for (const key of tierKeys) {
       const av = a[key] ? 1 : 0
       const bv = b[key] ? 1 : 0
@@ -556,10 +572,40 @@ function suggestSearch(
     return []
 
   try {
-    const { indexedTerms } = getTermLookup()
+    const { indexedTerms, aliases } = getTermLookup()
     const words = query.split(/\s+/)
     if (words.length > 1) {
       const suggestions = new Set<string>()
+      // Join one adjacent pair only when it identifies an indexed curated name.
+      for (let i = 0; i < words.length - 1; i++) {
+        const joined = normalizeFuzzyTerm(words[i] + words[i + 1])
+        const compounds =
+          aliases.get(joined) ?? (indexedTerms.has(joined) ? [joined] : [])
+        for (const compound of compounds) {
+          const corrected = [
+            ...words.slice(0, i),
+            compound,
+            ...words.slice(i + 2)
+          ].join(' ')
+          if (
+            !links.globalLinkPhrases.has(
+              corrected.replace(INVISIBLE_CHARS_RE, '').toLowerCase()
+            )
+          )
+            continue
+          if (
+            index.search(corrected, {
+              combineWith: 'AND',
+              fuzzy: false,
+              prefix: false
+            }).length
+          ) {
+            suggestions.add(corrected)
+            if (suggestions.size === MAX_SUGGESTIONS) return [...suggestions]
+          }
+        }
+      }
+      if (suggestions.size) return [...suggestions]
       for (const [i, word] of words.entries()) {
         if (tokenizeIndexLike(word).every((term) => indexedTerms.has(term)))
           continue
