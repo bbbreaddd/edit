@@ -35,7 +35,7 @@ import {
   groupMarks,
   mergeNearbyMarks
 } from './matchHighlighting'
-import { parseSearchQuery } from './normalization'
+import { INVISIBLE_CHARS_RE, parseSearchQuery } from './normalization'
 import { createSearchNavigation } from './resultNavigation'
 import {
   excerptCache,
@@ -532,6 +532,9 @@ export function useSearchModal() {
       const hasExclusions =
         searchQuery.excludedTerms.length > 0 ||
         searchQuery.excludedSites.length > 0
+      const literalQuery = searchQuery.text
+        .replace(INVISIBLE_CHARS_RE, '')
+        .toLowerCase()
       const needsContentFiltering =
         hasExclusions ||
         searchQuery.sites.length > 0 ||
@@ -540,7 +543,10 @@ export function useSearchModal() {
         (!fuzzy &&
           (/\s/.test(searchQuery.text) ||
             scopedResults.some(
-              (result) => !result.substringMatched && !result.urlMatched
+              (result) =>
+                !result.substringMatched &&
+                !result.urlMatched &&
+                !result.terms.some((term) => term.includes(literalQuery))
             )))
       // Content filtering needs a wider pool in both compact and detailed views.
       const candidateLimit = Math.max(MIN_CANDIDATE_POOL, limit * 2)
