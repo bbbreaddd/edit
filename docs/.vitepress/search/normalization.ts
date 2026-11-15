@@ -1,15 +1,53 @@
 export const INVISIBLE_CHARS_RE = /\u2060|\u200B|\u200C|\u200D|\uFEFF/g
 
 export function parseSearchQuery(value: string) {
-  const trimmed = value.trim()
-  const isPhrase =
-    (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) ||
-    (trimmed.startsWith('“') && trimmed.endsWith('”'))
+  const tokens = value.match(/[^\s"“]*(?:"[^"\n]*"|“[^”\n]*”)|\S+/g) ?? []
+  const sites: string[] = []
+  const excludedTerms: string[] = []
+  const excludedSites: string[] = []
+  const titles: string[] = []
+  const urls: string[] = []
+  const text: string[] = []
+  const branches: string[] = []
+  let branch: string[] = []
+  for (const token of tokens) {
+    if (token === 'OR' && branch.length) {
+      branches.push(branch.join(' '))
+      branch = []
+    } else branch.push(token)
+  }
+  if (branches.length && branch.length) branches.push(branch.join(' '))
+  else branches.length = 0
+
+  const unquote = (text: string) =>
+    /^".*"$|^“.*”$/.test(text) ? text.slice(1, -1) : text
+  for (const token of tokens) {
+    if (branches.length && token === 'OR') continue
+    const operator = token.match(/^(-site:|site:|intitle:|inurl:|-)(.+)$/i)
+    if (!operator) {
+      text.push(token)
+      continue
+    }
+    const targets: Record<string, string[]> = {
+      'site:': sites,
+      '-site:': excludedSites,
+      '-': excludedTerms,
+      'intitle:': titles,
+      'inurl:': urls
+    }
+    targets[operator[1].toLowerCase()].push(unquote(operator[2]))
+  }
+  const trimmed = text.join(' ')
+  const isPhrase = text.length === 1 && /^".*"$|^“.*”$/.test(trimmed)
   return {
-    text: (isPhrase ? trimmed.slice(1, -1) : trimmed)
-      .replace(/\s+/g, ' ')
-      .trim(),
-    isPhrase
+    text: (isPhrase ? unquote(trimmed) : trimmed).replace(/\s+/g, ' ').trim(),
+    isPhrase,
+    sites,
+    excludedTerms,
+    excludedSites,
+    titles,
+    urls,
+    branches
   }
 }
 

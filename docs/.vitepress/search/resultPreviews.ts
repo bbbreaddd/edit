@@ -9,8 +9,15 @@ import Tooltip from '../theme/components/Tooltip.vue'
 import {
   createPhraseRegex,
   INVISIBLE_CHARS_RE,
+  normalizeSearchUrl,
   parseSearchQuery
 } from './normalization'
+import {
+  buildUrlQuery,
+  createSiteMatcher,
+  normalizeUrlSearchValue,
+  urlMatchesNormalizedUrl
+} from './urlMatching'
 
 interface SearchExcerpt {
   html: string
@@ -192,10 +199,119 @@ function collectSearchBlocks(root: DocumentFragment): string[] {
 export function filterResults(
   results: LocalSearchResult[],
   filterTextValue: string,
-  allowMissingText = true
+  allowMissingText = true,
+  fuzzy = false
 ) {
-  const { text: query, isPhrase } = parseSearchQuery(filterTextValue)
+  const parsed = parseSearchQuery(filterTextValue)
+  const {
+    text: query,
+    isPhrase,
+    excludedTerms,
+    excludedSites,
+    branches
+  } = parsed
+  if (branches.length > 1) {
+    const matches = new Map<string, LocalSearchResult>()
+    for (const branch of branches) {
+      const eligible = results.filter((result) =>
+        result.searchBranches?.includes(branch)
+      )
+      for (const result of filterResults(
+        eligible,
+        branch,
+        allowMissingText,
+        fuzzy
+      )) {
+        if (!matches.has(result.id))
+          matches.set(result.id, { ...result, searchBranches: [branch] })
+      }
+    }
+    return results.flatMap((result) => matches.get(result.id) ?? [])
+  }
+  const hasExclusions = excludedTerms.length > 0 || excludedSites.length > 0
+  if (hasExclusions) {
+    const patterns = excludedTerms.map((term) =>
+      createPhraseRegex(normalizeText(term))
+    )
+    const hosts = excludedSites
+      .map(createSiteMatcher)
+      .filter((matcher) => matcher !== null)
+    const template = document.createElement('template')
+    results = results.flatMap((result) => {
+      const html = result.text || lookupExcerpt(result.id)?.html
+      if (!html) return []
+      template.innerHTML = html
+      for (const entry of template.content.querySelectorAll(
+        'li, p, pre, tr, blockquote'
+      )) {
+        if (!template.content.contains(entry)) continue
+        const own = entry.cloneNode(true) as Element
+        own.querySelectorAll('ul, ol').forEach((list) => list.remove())
+        const text = normalizeText(own.textContent ?? '')
+        const excluded =
+          patterns.some((pattern) => pattern.test(text)) ||
+          [...own.querySelectorAll('a[href]')].some((link) => {
+            try {
+              const url = new URL(
+                link.getAttribute('href')!,
+                'https://fmhy.net'
+              )
+              return hosts.some((matchesHost) => matchesHost(url.hostname))
+            } catch {
+              return false
+            }
+          })
+        if (excluded) entry.remove()
+      }
+      const blocks = collectSearchBlocks(template.content)
+      if (!blocks.length) return []
+      const links = [...template.content.querySelectorAll('a[href]')].flatMap(
+        (link) => {
+          try {
+            return [new URL(link.getAttribute('href')!, 'https://fmhy.net')]
+          } catch {
+            return []
+          }
+        }
+      )
+      if (
+        !parsed.sites.every((site) => {
+          const matchesHost = createSiteMatcher(site)
+          return matchesHost && links.some((link) => matchesHost(link.hostname))
+        }) ||
+        !parsed.urls.every((url) =>
+          links.some((link) =>
+            normalizeSearchUrl(normalizeUrlSearchValue(link.href)).includes(
+              normalizeSearchUrl(normalizeUrlSearchValue(url))
+            )
+          )
+        )
+      )
+        return []
+      const urlQuery = buildUrlQuery(query)
+      const urlMatched =
+        !!result.urlMatched &&
+        !!urlQuery &&
+        links.some((link) =>
+          urlMatchesNormalizedUrl(normalizeUrlSearchValue(link.href), urlQuery)
+        )
+      if (
+        !urlMatched &&
+        fuzzy &&
+        !isPhrase &&
+        query &&
+        ![result.title, ...result.titles, ...blocks].some((text) =>
+          result.terms.some((term) =>
+            normalizeText(text).includes(term.toLowerCase())
+          )
+        )
+      )
+        return []
+      return [{ ...result, urlMatched, text: template.innerHTML }]
+    })
+  }
   if (!query) return isPhrase ? [] : results
+  if (fuzzy && !isPhrase) return results
   const multiword = /\s/.test(query)
   const template =
     multiword || isPhrase ? document.createElement('template') : null
@@ -213,7 +329,7 @@ export function filterResults(
     if (
       !isPhrase &&
       !multiword &&
-      (result.urlMatched || result.substringMatched)
+      (result.urlMatched || (!hasExclusions && result.substringMatched))
     )
       return true
     const headings = [result.title, ...result.titles].map(clean)

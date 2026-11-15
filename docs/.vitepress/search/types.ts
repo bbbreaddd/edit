@@ -8,6 +8,7 @@ export interface Result {
   urlMatchedStarred?: boolean
   urlMatchRank?: number
   substringMatched?: boolean
+  searchBranches?: string[]
 }
 
 export interface SidebarItem {

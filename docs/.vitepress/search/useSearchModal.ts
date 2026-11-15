@@ -273,12 +273,12 @@ export function useSearchModal() {
     : useSessionStorage('vitepress:local-search-filter', '')
 
   // URL matching also kicks in automatically when the query *looks* like a URL even with the manual toggle off.
-  const urlSearchAuto = computed(
-    () =>
-      !isUrlSearch.value &&
-      !!filterText.value &&
-      looksLikeUrlQuery(filterText.value)
-  )
+  const urlSearchAuto = computed(() => {
+    const query = parseSearchQuery(filterText.value)
+    return (
+      !isUrlSearch.value && !query.isPhrase && looksLikeUrlQuery(query.text)
+    )
+  })
 
   const showDetailedList = useLocalStorage(
     'vitepress:local-search-detailed-list',
@@ -529,7 +529,14 @@ export function useSearchModal() {
       const terms = new Set<string>()
 
       const searchQuery = parseSearchQuery(query)
+      const hasExclusions =
+        searchQuery.excludedTerms.length > 0 ||
+        searchQuery.excludedSites.length > 0
       const needsContentFiltering =
+        hasExclusions ||
+        searchQuery.branches.some(
+          (branch) => parseSearchQuery(branch).isPhrase
+        ) ||
         searchQuery.isPhrase ||
         (!fuzzy &&
           (/\s/.test(searchQuery.text) ||
@@ -542,10 +549,14 @@ export function useSearchModal() {
         ? scopedResults.slice(0, candidateLimit)
         : sliced
       const includeExcerpts = needsContentFiltering || showDetailedListValue
-      const knownMatches = new Set(filterResults(candidates, query, false))
+      const knownMatches = new Set(
+        filterResults(candidates, query, false, fuzzy).map(
+          (result) => result.id
+        )
+      )
       const previewCandidates = candidates.filter(
         (result, index) =>
-          (needsContentFiltering && !knownMatches.has(result)) ||
+          (needsContentFiltering && !knownMatches.has(result.id)) ||
           (showDetailedListValue && index < limit)
       )
       await loadExcerpts(previewCandidates, vitePressData, isCanceled)
@@ -561,7 +572,7 @@ export function useSearchModal() {
         }
       })
       const filtered = needsContentFiltering
-        ? filterResults(mapped, query)
+        ? filterResults(mapped, query, true, fuzzy)
         : mapped
       const finalResults = needsContentFiltering
         ? filtered.slice(0, limit)
@@ -569,8 +580,10 @@ export function useSearchModal() {
       if (showDetailedListValue) {
         await loadExcerpts(finalResults, vitePressData, isCanceled)
         if (isCanceled()) return
-        for (const result of finalResults)
-          result.text = lookupExcerptText(result.id)
+        if (!hasExclusions) {
+          for (const result of finalResults)
+            result.text = lookupExcerptText(result.id)
+        }
       }
       const totalCount = needsContentFiltering
         ? filtered.length
@@ -587,7 +600,7 @@ export function useSearchModal() {
       }
 
       if (!fuzzy) {
-        terms.add(query)
+        terms.add(searchQuery.text)
       }
 
       results.value = finalResults
@@ -630,7 +643,7 @@ export function useSearchModal() {
       // the query text isn't in the visible link text. Highlight the specific
       // link(s) in the excerpt whose href matched the query.
       if (finalResults.some((r) => r.urlMatched)) {
-        const urlQuery = buildUrlQuery(query)
+        const urlQuery = buildUrlQuery(searchQuery.text)
         for (const r of finalResults) {
           if (!r.urlMatched || !urlQuery) continue
           const item = resultsEl.value?.querySelector(
@@ -919,7 +932,11 @@ export function useSearchModal() {
       addRecentSearch(filterText.value)
       const idx = results.value.indexOf(selectedPackage)
       const matchCtx = idx >= 0 ? getMatchContext(idx) : null
-      navigateToResult(selectedPackage.id, matchCtx)
+      navigateToResult(
+        selectedPackage.id,
+        matchCtx,
+        selectedPackage.searchBranches?.[0]
+      )
     }
   })
 
@@ -1023,7 +1040,7 @@ export function useSearchModal() {
     urlOn: 'Only search names and text',
     urlOff: 'Search link URLs too',
     get urlAuto() {
-      return isExplicitUrlQuery(filterText.value)
+      return isExplicitUrlQuery(parseSearchQuery(filterText.value).text)
         ? 'URL detected — searching link URLs. Click to keep this on.'
         : 'Searching names, text, and link URLs. Click to keep URL matching on.'
     },
@@ -1105,7 +1122,11 @@ export function useSearchModal() {
     // Find which result index was clicked to get the match context
     const index = results.value.findIndex((r) => r.id === id)
     const matchContext = index >= 0 ? getMatchContext(index) : null
-    navigateToResult(id, matchContext)
+    navigateToResult(
+      id,
+      matchContext,
+      results.value[index]?.searchBranches?.[0]
+    )
   }
 
   function resetSearch() {

@@ -8,13 +8,16 @@ import type {
 import type { UrlRecord } from './urlMatching'
 import MiniSearch from 'minisearch'
 import {
+  createPhraseRegex,
   INVISIBLE_CHARS_RE,
+  normalizeSearchUrl,
   parseSearchQuery,
   tokenizeIndexLike,
   tokenizeSearchText
 } from './normalization'
 import {
   buildUrlIndex,
+  findSiteMatches,
   findUrlMatches,
   isExplicitUrlQuery,
   looksLikeUrlQuery
@@ -84,8 +87,54 @@ function runSearch(
   phraseTokens: Map<string, Set<string>>,
   getUrlIndex: () => UrlRecord[]
 ) {
-  const { text, isPhrase } = parseSearchQuery(filterTextValue)
+  const parsed = parseSearchQuery(filterTextValue)
+  const { text, isPhrase, sites, titles, urls, branches } = parsed
+  if (branches.length > 1) {
+    const alternatives = branches.map(
+      (branch) =>
+        runSearch(
+          index,
+          metadata,
+          cachedTermKeys,
+          branch,
+          options,
+          sidebar,
+          phraseTokens,
+          getUrlIndex
+        ).results
+    )
+    const merged = new Map<string, LocalSearchResult>()
+    for (
+      let rank = 0;
+      rank < Math.max(...alternatives.map((results) => results.length));
+      rank++
+    ) {
+      for (const [i, results] of alternatives.entries()) {
+        const result = results[rank]
+        if (!result) continue
+        const previous = merged.get(result.id)
+        if (previous) previous.searchBranches!.push(branches[i])
+        else merged.set(result.id, { ...result, searchBranches: [branches[i]] })
+      }
+    }
+    return { results: [...merged.values()].slice(0, MAX_RESULTS_IN_MEMORY) }
+  }
   filterTextValue = text
+  const siteMatches = sites.length
+    ? findSiteMatches(getUrlIndex(), sites)
+    : undefined
+  const filtersOnly =
+    !text &&
+    !isPhrase &&
+    !!(
+      sites.length ||
+      titles.length ||
+      urls.length ||
+      parsed.excludedTerms.length ||
+      parsed.excludedSites.length
+    )
+  const titlePatterns = titles.map((title) => createPhraseRegex(title))
+  const urlFilters = urls.map((url) => normalizeSearchUrl(url.toLowerCase()))
   const fuzzy = options.fuzzy && !isPhrase
   let substringTerms: Set<string> | undefined
   let query: Query = filterTextValue
@@ -152,9 +201,13 @@ function runSearch(
   const queryLooksLikeUrl = !isPhrase && isExplicitUrlQuery(filterTextValue)
   // Pasted URLs should search URLs only. Running the normal text index too
   // turns URL punctuation into generic terms and leaks unrelated results.
-  const rawResults = queryLooksLikeUrl
-    ? []
-    : (index.search(query, searchOptions) as LocalSearchResult[])
+  const rawResults = filtersOnly
+    ? (index.search(MiniSearch.wildcard) as LocalSearchResult[]).map(
+        (result) => ({ ...result, urlMatched: true })
+      )
+    : queryLooksLikeUrl
+      ? []
+      : (index.search(query, searchOptions) as LocalSearchResult[])
   const searchUrls =
     !isPhrase && (options.urls || looksLikeUrlQuery(filterTextValue))
   const urlResults = searchUrls
@@ -181,21 +234,31 @@ function runSearch(
   }
 
   const sidebarItems = Array.isArray(sidebar) ? sidebar : []
-  const currentResults: LocalSearchResult[] = [
-    ...mergedResultsById.values()
-  ].map((r) => {
-    const [id] = r.id.split('#')
-    const cleanPath = '/' + id.replace(/\.html$/, '').replace(/^\//, '')
-    const pageTitle = findPageTitle(sidebarItems, cleanPath)
-    const titles = [...r.titles]
+  const currentResults: LocalSearchResult[] = [...mergedResultsById.values()]
+    .filter((result) => !siteMatches || siteMatches.has(result.id))
+    .map((r) => {
+      const [id] = r.id.split('#')
+      const cleanPath = '/' + id.replace(/\.html$/, '').replace(/^\//, '')
+      const pageTitle = findPageTitle(sidebarItems, cleanPath)
+      const titles = [...r.titles]
 
-    if (pageTitle && !titles.includes(pageTitle) && r.title !== pageTitle) {
-      titles.unshift(pageTitle)
-    }
+      if (pageTitle && !titles.includes(pageTitle) && r.title !== pageTitle) {
+        titles.unshift(pageTitle)
+      }
 
-    return { ...r, titles }
-  })
+      return { ...r, titles }
+    })
+    .filter(
+      (result) =>
+        titlePatterns.every((pattern) =>
+          [result.title, ...result.titles].some((title) => pattern.test(title))
+        ) &&
+        urlFilters.every((filter) =>
+          metadata[result.id]?.u?.some((url) => url.includes(filter))
+        )
+    )
 
+  // Complete single-word matches rank before expansions; these tiers break ties.
   // Ranking model:
   //   1. starredExact  \u2013 query exactly matches a starred-bold hyperlink
   //   2. exact         \u2013 query exactly matches any hyperlink
@@ -216,6 +279,30 @@ function runSearch(
     fuzzy && /\s/.test(q) && !looksLikeUrlQuery(q)
       ? [...new Set(tokenizeIndexLike(q))]
       : []
+
+  const singleTerms =
+    !options.urls && !isPhrase && !/\s/.test(q) && !looksLikeUrlQuery(q)
+      ? tokenizeIndexLike(q)
+      : []
+  // Prefer complete words over prefix/substring expansions; Fuzzy tolerates spelling punctuation.
+  const wordKey = (word: string) =>
+    fuzzy
+      ? word.normalize('NFD').replace(/\p{M}/gu, '').replace(/[-'’]/g, '')
+      : word
+  const singleKey =
+    singleTerms.length === 1 ? wordKey(singleTerms[0]) : undefined
+  const directMatches =
+    singleKey !== undefined
+      ? new Set<string>(
+          currentResults
+            .filter(
+              (result) =>
+                Object.keys(result.match).length > 0 &&
+                result.terms.some((term) => wordKey(term) === singleKey)
+            )
+            .map((result) => result.id)
+        )
+      : undefined
 
   const boostedResults = currentResults.map((r) => {
     const meta = metadata[r.id]
@@ -300,6 +387,11 @@ function runSearch(
   ]
 
   boostedResults.sort((a, b) => {
+    if (directMatches) {
+      const difference =
+        Number(directMatches.has(b.id)) - Number(directMatches.has(a.id))
+      if (difference) return difference
+    }
     for (const key of tierKeys) {
       const av = a[key] ? 1 : 0
       const bv = b[key] ? 1 : 0
@@ -327,8 +419,19 @@ function suggestSearch(
   links: ReturnType<typeof collectLinkTerms>,
   indexedTerms: Set<string>
 ): string[] {
-  const { text: query, isPhrase } = parseSearchQuery(text)
-  if (!query || isPhrase) return []
+  const { text: query, isPhrase, sites } = parseSearchQuery(text)
+  const parsed = parseSearchQuery(text)
+  if (
+    !query ||
+    isPhrase ||
+    sites.length ||
+    parsed.excludedTerms.length ||
+    parsed.excludedSites.length ||
+    parsed.titles.length ||
+    parsed.urls.length ||
+    parsed.branches.length
+  )
+    return []
 
   try {
     const words = query.split(/\s+/)

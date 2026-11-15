@@ -269,6 +269,45 @@ export function buildUrlIndex(customMetadata: SearchMetadata): UrlRecord[] {
   return records
 }
 
+export function createSiteMatcher(site: string) {
+  try {
+    const url = new URL(
+      `https://${stripSchemeAndWww(normalizeUrlSearchValue(site))}`
+    )
+    if (
+      url.pathname !== '/' ||
+      url.search ||
+      url.hash ||
+      url.username ||
+      url.password ||
+      url.port
+    )
+      return null
+    const host = url.hostname.replace(/\.$/, '')
+    return (candidate: string) => hostMatchRank(candidate, host, false) > 0
+  } catch {
+    return null
+  }
+}
+
+// Site filters deliberately include shared hosts and do not use URL-search caps.
+export function findSiteMatches(records: UrlRecord[], sites: string[]) {
+  let matches: Set<string> | undefined
+  for (const site of sites) {
+    const matchesHost = createSiteMatcher(site)
+    if (!matchesHost) return new Set<string>()
+    const current = new Set(
+      records
+        .filter((record) => matchesHost(record.host))
+        .map((record) => record.id)
+    )
+    matches = matches
+      ? new Set([...matches].filter((id) => current.has(id)))
+      : current
+  }
+  return matches ?? new Set<string>()
+}
+
 // How strongly a haystack matches a needle: 3 = exact, 2 = prefix, 1 = substring,
 // 0 = no match. Lets findUrlMatches keep the most relevant matches when a cap
 // forces a cut, instead of dropping by arbitrary index order.

@@ -115,10 +115,19 @@ export function formMarkRegex(
   terms: Set<string>,
   rawQuery: string,
   fuzzy: boolean
-) {
-  const { text: query, isPhrase } = parseSearchQuery(rawQuery)
+): RegExp {
+  const { text: query, isPhrase, branches, titles } = parseSearchQuery(rawQuery)
+  if (branches.length > 1) {
+    return new RegExp(
+      branches
+        .map((branch) => `(?:${formMarkRegex(terms, branch, fuzzy).source})`)
+        .join('|'),
+      'giu'
+    )
+  }
   if (isPhrase) return createPhraseRegex(query, true)
-  const allTerms = new Set(terms)
+  const allTerms = new Set([...terms].filter((term) => term !== rawQuery))
+  for (const title of titles) allTerms.add(title)
   if (fuzzy && !isExplicitUrlQuery(query)) {
     const words = tokenizeSearchText(query).filter(Boolean)
     for (const word of words) {
@@ -134,6 +143,7 @@ export function formMarkRegex(
       }
     }
   }
+  if (![...allTerms].some(Boolean)) return /(?!)/g
   return new RegExp(
     [...allTerms]
       .filter(Boolean)

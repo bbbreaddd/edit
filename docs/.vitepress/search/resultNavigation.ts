@@ -12,7 +12,11 @@ export function createSearchNavigation(
   getBase: () => string,
   close: () => void
 ) {
-  function navigateToResult(id: string, matchContext: string | null = null) {
+  function navigateToResult(
+    id: string,
+    matchContext: string | null = null,
+    rawQuery = getQuery()
+  ) {
     // Dismiss mobile keyboard immediately by blurring the active input.
     // This triggers a viewport resize so we calculate the correct scroll position.
     if (
@@ -23,7 +27,7 @@ export function createSearchNavigation(
     }
 
     const [path, hash] = id.split('#')
-    const query = parseSearchQuery(getQuery()).text
+    const query = parseSearchQuery(rawQuery).text
     let decodedHash: string | null = null
     try {
       decodedHash = hash ? decodeURIComponent(hash) : null
