@@ -6,16 +6,25 @@ import { pathToFile } from 'vitepress/dist/client/app/utils'
 import { createApp, h } from 'vue'
 import CriticalBadge from '../theme/components/CriticalBadge.vue'
 import Tooltip from '../theme/components/Tooltip.vue'
-import { INVISIBLE_CHARS_RE } from './normalization'
+import {
+  createPhraseRegex,
+  INVISIBLE_CHARS_RE,
+  parseSearchQuery
+} from './normalization'
 
-export const excerptCache = new Map<string, Map<string, string>>()
+interface SearchExcerpt {
+  html: string
+  blocks?: string[]
+}
 
-export function lookupExcerptText(resultId: string): string {
+export const excerptCache = new Map<string, Map<string, SearchExcerpt>>()
+
+function lookupExcerpt(resultId: string): SearchExcerpt | undefined {
   const hashIndex = resultId.indexOf('#')
-  if (hashIndex === -1) return ''
+  if (hashIndex === -1) return undefined
   const pageId = resultId.slice(0, hashIndex)
   const map = excerptCache.get(pageId)
-  if (!map) return ''
+  if (!map) return undefined
   const anchor = resultId.slice(hashIndex + 1)
   const direct = map.get(anchor)
   if (direct) return direct
@@ -26,13 +35,17 @@ export function lookupExcerptText(resultId: string): string {
   // anchor as a prefix of a DOM key — but only when exactly one key matches, so
   // an ambiguous prefix never silently returns a sibling section's excerpt.
   const prefix = anchor + '-'
-  let found: string | null = null
-  for (const [key, html] of map) {
+  let found: SearchExcerpt | undefined
+  for (const [key, excerpt] of map) {
     if (!key.startsWith(prefix)) continue
-    if (found !== null) return ''
-    found = html
+    if (found !== undefined) return undefined
+    found = excerpt
   }
-  return found ?? ''
+  return found
+}
+
+export function lookupExcerptText(resultId: string): string {
+  return lookupExcerpt(resultId)?.html ?? ''
 }
 
 export async function fetchExcerpt(id: string) {
@@ -83,7 +96,7 @@ export async function processExcerpts(
     const hashIndex = id.indexOf('#')
     const mapId = hashIndex === -1 ? id : id.slice(0, hashIndex)
     if (excerptCache.has(mapId)) continue
-    const map = new Map<string, string>()
+    const map = new Map<string, SearchExcerpt>()
     const comp = (mod.default ?? mod) as ComponentModule
     if (comp && typeof comp === 'object' && (comp.render || comp.setup)) {
       try {
@@ -135,7 +148,7 @@ export async function processExcerpts(
               if (!isNoteBlock) html += next.outerHTML
               next = next.nextElementSibling
             }
-            map.set(anchor, html)
+            map.set(anchor, { html })
           })
           excerptCache.set(mapId, map)
         } finally {
@@ -148,27 +161,75 @@ export async function processExcerpts(
   }
 }
 
+function normalizeText(text: string) {
+  return text
+    .replace(INVISIBLE_CHARS_RE, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+}
+
+function collectSearchBlocks(root: DocumentFragment): string[] {
+  const blocks: string[] = []
+  let owner: Node | undefined
+  let parts: string[] = []
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT)
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const parent = node.parentElement
+    if (parent?.closest('script, style')) continue
+    const block = parent?.closest('p, li, pre, tr, blockquote, div') ?? root
+    if (block !== owner) {
+      if (parts.length) blocks.push(normalizeText(parts.join('')))
+      parts = []
+      owner = block
+    }
+    parts.push(node.textContent ?? '')
+  }
+  if (parts.length) blocks.push(normalizeText(parts.join('')))
+  return blocks.filter(Boolean)
+}
+
 export function filterResults(
   results: LocalSearchResult[],
   filterTextValue: string,
   allowMissingText = true
 ) {
-  const clean = (s: string) =>
-    s
-      .replace(INVISIBLE_CHARS_RE, '')
-      .replace(/<[^>]*>/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .toLowerCase()
+  const { text: query, isPhrase } = parseSearchQuery(filterTextValue)
+  if (!query) return isPhrase ? [] : results
+  const multiword = /\s/.test(query)
+  const template =
+    multiword || isPhrase ? document.createElement('template') : null
+  const clean = (html: string) => {
+    if (!template) return normalizeText(html.replace(/<[^>]*>/g, ' '))
+    template.innerHTML = html
+    return normalizeText(template.content.textContent ?? '')
+  }
+  const phrase = clean(query)
+  const phrasePattern = isPhrase ? createPhraseRegex(phrase) : null
+  const matchesPhrase = (text: string) =>
+    phrasePattern ? phrasePattern.test(text) : text.includes(phrase)
 
-  const phrase = clean(filterTextValue)
-  if (!phrase) return results
+  return results.filter((result) => {
+    if (
+      !isPhrase &&
+      !multiword &&
+      (result.urlMatched || result.substringMatched)
+    )
+      return true
+    const headings = [result.title, ...result.titles].map(clean)
+    if (headings.some(matchesPhrase)) return true
 
-  return results.filter((r) => {
-    if (clean(r.title).includes(phrase)) return true
-    if (r.titles.some((t) => clean(t).includes(phrase))) return true
-    if (r.urlMatched || r.substringMatched) return true
-    if (!r.text) return allowMissingText
-    return clean(r.text).includes(phrase)
+    const cached = lookupExcerpt(result.id)
+    const html = result.text || cached?.html
+    if (!html) return allowMissingText
+    if (!template) return clean(html).includes(phrase)
+
+    let blocks = cached?.html === html ? cached.blocks : undefined
+    if (!blocks) {
+      template.innerHTML = html
+      blocks = collectSearchBlocks(template.content)
+      if (cached?.html === html) cached.blocks = blocks
+    }
+    return blocks.some(matchesPhrase)
   })
 }

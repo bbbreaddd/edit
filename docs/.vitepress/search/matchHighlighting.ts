@@ -1,5 +1,10 @@
 import { escapeRegExp } from 'vitepress/dist/client/shared'
-import { stripSchemeAndWww, tokenizeSearchText } from './normalization'
+import {
+  createPhraseRegex,
+  parseSearchQuery,
+  stripSchemeAndWww,
+  tokenizeSearchText
+} from './normalization'
 import { isExplicitUrlQuery, normalizeUrlSearchValue } from './urlMatching'
 
 const MARK_MERGE_DISTANCE_PX = 20
@@ -111,16 +116,18 @@ export function formMarkRegex(
   rawQuery: string,
   fuzzy: boolean
 ) {
+  const { text: query, isPhrase } = parseSearchQuery(rawQuery)
+  if (isPhrase) return createPhraseRegex(query, true)
   const allTerms = new Set(terms)
-  if (fuzzy && !isExplicitUrlQuery(rawQuery)) {
-    const words = tokenizeSearchText(rawQuery).filter(Boolean)
+  if (fuzzy && !isExplicitUrlQuery(query)) {
+    const words = tokenizeSearchText(query).filter(Boolean)
     for (const word of words) {
       allTerms.add(word)
     }
   } else {
-    const trimmed = rawQuery.trim()
+    const trimmed = query
     allTerms.add(trimmed)
-    if (isExplicitUrlQuery(rawQuery)) {
+    if (isExplicitUrlQuery(query)) {
       const stripped = stripSchemeAndWww(normalizeUrlSearchValue(trimmed))
       if (stripped && stripped !== trimmed.toLowerCase()) {
         allTerms.add(stripped)

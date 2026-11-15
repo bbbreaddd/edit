@@ -4,6 +4,7 @@ import {
   pendingScrollQuery,
   scheduleScrollToMatch
 } from '../theme/composables/searchScroll'
+import { parseSearchQuery } from './normalization'
 
 export function createSearchNavigation(
   router: Router,
@@ -22,7 +23,7 @@ export function createSearchNavigation(
     }
 
     const [path, hash] = id.split('#')
-    const query = getQuery()
+    const query = parseSearchQuery(getQuery()).text
     let decodedHash: string | null = null
     try {
       decodedHash = hash ? decodeURIComponent(hash) : null

@@ -35,6 +35,7 @@ import {
   groupMarks,
   mergeNearbyMarks
 } from './matchHighlighting'
+import { parseSearchQuery } from './normalization'
 import { createSearchNavigation } from './resultNavigation'
 import {
   excerptCache,
@@ -527,21 +528,24 @@ export function useSearchModal() {
 
       const terms = new Set<string>()
 
-      const needsPhraseFiltering =
-        !fuzzy &&
-        scopedResults.some(
-          (result) => !result.substringMatched && !result.urlMatched
-        )
-      // Exact phrase filtering needs a wider pool in both compact and detailed views.
+      const searchQuery = parseSearchQuery(query)
+      const needsContentFiltering =
+        searchQuery.isPhrase ||
+        (!fuzzy &&
+          (/\s/.test(searchQuery.text) ||
+            scopedResults.some(
+              (result) => !result.substringMatched && !result.urlMatched
+            )))
+      // Content filtering needs a wider pool in both compact and detailed views.
       const candidateLimit = Math.max(MIN_CANDIDATE_POOL, limit * 2)
-      const candidates = needsPhraseFiltering
+      const candidates = needsContentFiltering
         ? scopedResults.slice(0, candidateLimit)
         : sliced
-      const includeExcerpts = needsPhraseFiltering || showDetailedListValue
+      const includeExcerpts = needsContentFiltering || showDetailedListValue
       const knownMatches = new Set(filterResults(candidates, query, false))
       const previewCandidates = candidates.filter(
         (result, index) =>
-          (needsPhraseFiltering && !knownMatches.has(result)) ||
+          (needsContentFiltering && !knownMatches.has(result)) ||
           (showDetailedListValue && index < limit)
       )
       await loadExcerpts(previewCandidates, vitePressData, isCanceled)
@@ -556,10 +560,10 @@ export function useSearchModal() {
           text: includeExcerpts ? lookupExcerptText(result.id) : ''
         }
       })
-      const filtered = needsPhraseFiltering
+      const filtered = needsContentFiltering
         ? filterResults(mapped, query)
         : mapped
-      const finalResults = needsPhraseFiltering
+      const finalResults = needsContentFiltering
         ? filtered.slice(0, limit)
         : filtered
       if (showDetailedListValue) {
@@ -568,17 +572,17 @@ export function useSearchModal() {
         for (const result of finalResults)
           result.text = lookupExcerptText(result.id)
       }
-      const totalCount = needsPhraseFiltering
+      const totalCount = needsContentFiltering
         ? filtered.length
         : mapped.length + Math.max(0, scopedResults.length - limit)
       // Expanding the limit also expands the pool of exact matches being checked.
       const mayHaveMoreValue =
-        needsPhraseFiltering && scopedResults.length > candidateLimit
+        needsContentFiltering && scopedResults.length > candidateLimit
 
       if (resultSetChanged) {
         // A category's preview filtering must not remove the other category chips.
         categoryCounts.value = computeCategoryCounts(
-          needsPhraseFiltering && !category ? filtered : allRes
+          needsContentFiltering && !category ? filtered : allRes
         )
       }
 

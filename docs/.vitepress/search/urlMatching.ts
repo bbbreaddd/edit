@@ -4,6 +4,7 @@ import type { Result, SearchMetadata } from './types'
 import {
   INVISIBLE_CHARS_RE,
   normalizeSearchUrl,
+  parseSearchQuery,
   stripSchemeAndWww
 } from './normalization'
 
@@ -187,6 +188,7 @@ export function isExplicitUrlQuery(query: string) {
 }
 
 export function looksLikeUrlQuery(query: string) {
+  if (parseSearchQuery(query).isPhrase) return false
   return (
     isExplicitUrlQuery(query) ||
     (!/\s/.test(query.trim()) && normalizeUrlSearchValue(query).includes('.'))

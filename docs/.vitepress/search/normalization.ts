@@ -1,5 +1,30 @@
 export const INVISIBLE_CHARS_RE = /\u2060|\u200B|\u200C|\u200D|\uFEFF/g
 
+export function parseSearchQuery(value: string) {
+  const trimmed = value.trim()
+  const isPhrase =
+    (trimmed.startsWith('"') && trimmed.endsWith('"') && trimmed.length >= 2) ||
+    (trimmed.startsWith('“') && trimmed.endsWith('”'))
+  return {
+    text: (isPhrase ? trimmed.slice(1, -1) : trimmed)
+      .replace(/\s+/g, ' ')
+      .trim(),
+    isPhrase
+  }
+}
+
+export function createPhraseRegex(text: string, global = false) {
+  if (!text) return /(?!)/g
+  const characters = Array.from(text)
+  const word = /[\p{L}\p{N}_]/u
+  const start = word.test(characters[0]) ? '(?<![\\p{L}\\p{N}_])' : ''
+  const end = word.test(characters[characters.length - 1])
+    ? '(?![\\p{L}\\p{N}_])'
+    : ''
+  const escaped = text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(start + escaped + end, global ? 'giu' : 'iu')
+}
+
 export function tokenizeIndexLike(
   text: string,
   splitDottedParts = false

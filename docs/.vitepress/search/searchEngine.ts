@@ -9,6 +9,7 @@ import type { UrlRecord } from './urlMatching'
 import MiniSearch from 'minisearch'
 import {
   INVISIBLE_CHARS_RE,
+  parseSearchQuery,
   tokenizeIndexLike,
   tokenizeSearchText
 } from './normalization'
@@ -83,10 +84,13 @@ function runSearch(
   phraseTokens: Map<string, Set<string>>,
   getUrlIndex: () => UrlRecord[]
 ) {
+  const { text, isPhrase } = parseSearchQuery(filterTextValue)
+  filterTextValue = text
+  const fuzzy = options.fuzzy && !isPhrase
   let substringTerms: Set<string> | undefined
   let query: Query = filterTextValue
 
-  if (options.fuzzy) {
+  if (fuzzy) {
     const parts = filterTextValue.split(/\s+/).filter((p) => p)
     if (parts.length > 0) {
       const dashed = parts.join('-')
@@ -113,7 +117,12 @@ function runSearch(
    * For exact mode, find index terms containing the query as a substring
    * (e.g. "abolic" → "parabolic") using the pre-cached term key list.
    */
-  if (!options.fuzzy && filterTextValue.length > 2) {
+  if (
+    !fuzzy &&
+    !isPhrase &&
+    !/\s/.test(filterTextValue) &&
+    filterTextValue.length > 2
+  ) {
     const candidateTerms: string[] = []
     const match = filterTextValue.toLowerCase()
     for (const term of cachedTermKeys) {
@@ -136,16 +145,18 @@ function runSearch(
   // fuzzy only matters for string queries; structured queries carry their own per-clause fuzzy
   const searchOptions = {
     combineWith: 'AND' as const,
-    fuzzy: options.fuzzy && typeof query === 'string' ? fuzzyTolerance : false
+    fuzzy: fuzzy && typeof query === 'string' ? fuzzyTolerance : false,
+    ...(isPhrase ? { prefix: false } : {})
   }
 
-  const queryLooksLikeUrl = isExplicitUrlQuery(filterTextValue)
+  const queryLooksLikeUrl = !isPhrase && isExplicitUrlQuery(filterTextValue)
   // Pasted URLs should search URLs only. Running the normal text index too
   // turns URL punctuation into generic terms and leaks unrelated results.
   const rawResults = queryLooksLikeUrl
     ? []
     : (index.search(query, searchOptions) as LocalSearchResult[])
-  const searchUrls = options.urls || looksLikeUrlQuery(filterTextValue)
+  const searchUrls =
+    !isPhrase && (options.urls || looksLikeUrlQuery(filterTextValue))
   const urlResults = searchUrls
     ? findUrlMatches(index, filterTextValue, getUrlIndex())
     : []
@@ -200,6 +211,11 @@ function runSearch(
   // not against individual tokens. Strip zero-width characters from the
   // query to match the build-time normalization in extractLinkMetadata.
   const q = filterTextValue.replace(INVISIBLE_CHARS_RE, '').trim().toLowerCase()
+  // Multiword fuzzy queries need all query words in one link to earn a word boost.
+  const requiredLinkTerms =
+    fuzzy && /\s/.test(q) && !looksLikeUrlQuery(q)
+      ? [...new Set(tokenizeIndexLike(q))]
+      : []
 
   const boostedResults = currentResults.map((r) => {
     const meta = metadata[r.id]
@@ -234,7 +250,13 @@ function runSearch(
             tokens = new Set(tokenizeIndexLike(phrase, true))
             phraseTokens.set(phrase, tokens)
           }
-          if (lowerTerms.some((t) => tokens.has(t))) {
+          const words = requiredLinkTerms.length > 1 ? [...tokens] : undefined
+          const matches = words
+            ? requiredLinkTerms.every((term) =>
+                words.some((word) => word.startsWith(term))
+              )
+            : lowerTerms.some((term) => tokens.has(term))
+          if (matches) {
             if (isStarred) hasStarredWord = true
             else hasLinkWord = true
           }
@@ -305,8 +327,8 @@ function suggestSearch(
   links: ReturnType<typeof collectLinkTerms>,
   indexedTerms: Set<string>
 ): string[] {
-  const query = text.trim()
-  if (!query) return []
+  const { text: query, isPhrase } = parseSearchQuery(text)
+  if (!query || isPhrase) return []
 
   try {
     const words = query.split(/\s+/)
