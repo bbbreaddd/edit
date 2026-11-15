@@ -83,6 +83,8 @@ function getDocId(file: string) {
 }
 
 function extractLinkMetadata(html: string) {
+  // Warning prose stays searchable, but its links are not curated entries.
+  html = html.replace(/<CriticalBadge\b[\s\S]*?<\/CriticalBadge\s*>/gi, '')
   const links = new Set<string>()
   const starredBoldLinks = new Set<string>()
   const urls = new Set<string>()

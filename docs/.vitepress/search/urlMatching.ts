@@ -201,7 +201,7 @@ export function urlMatchesNormalizedUrl(
 ) {
   const hostPath = normalizeSearchUrl(normalizedUrl)
   if (urlQuery.mode === 'path') {
-    return hostPath.includes(urlQuery.needle)
+    return pathMatchRank(hostPath, urlQuery) > 0
   }
   const host = hostPath.split(/[/?#]/)[0]
   const { label, registrable } = urlRegistrable(host)
@@ -209,8 +209,10 @@ export function urlMatchesNormalizedUrl(
   if (URL_SHARED_DOMAINS.has(host) || URL_SHARED_DOMAINS.has(registrable)) {
     return false
   }
-  const target = urlQuery.matchFullHost ? host : label
-  const haystacks = [target, compactUrlValue(target)]
+  if (urlQuery.matchFullHost) {
+    return hostMatchRank(host, urlQuery.needles[0], urlQuery.anchored) > 0
+  }
+  const haystacks = [label, compactUrlValue(label)]
   return urlQuery.needles.some((needle) => {
     // Mirror recordMatchRank: anchored queries and short needles match by
     // prefix only, longer needles also match a mid-label substring.
@@ -230,7 +232,6 @@ export interface UrlRecord {
   host: string // host only (e.g. "github.com")
   label: string // registrable label (e.g. "pi-hole")
   registrable: string // registrable domain (e.g. "pi-hole.net")
-  compactHost: string // punctuation-stripped host
   compactLabel: string // punctuation-stripped label
   isShared: boolean // host/registrable is a suppressed shared platform
   starred: boolean // URL came from a starred list item
@@ -256,7 +257,6 @@ export function buildUrlIndex(customMetadata: SearchMetadata): UrlRecord[] {
         host,
         label,
         registrable,
-        compactHost: compactUrlValue(host),
         compactLabel: compactUrlValue(label),
         isShared:
           URL_SHARED_DOMAINS.has(host) || URL_SHARED_DOMAINS.has(registrable),
@@ -277,17 +277,48 @@ function matchStrength(haystack: string, needle: string) {
   return 0
 }
 
+// Complete domains retain punctuation and match only whole host labels.
+function hostMatchRank(host: string, needle: string, anchored: boolean) {
+  const domain = needle.replace(/\.(?=:\d+$|$)/, '')
+  const target = (
+    needle.includes(':') ? host : host.replace(/:\d+$/, '')
+  ).replace(/\.(?=:\d+$|$)/, '')
+  if (target === domain) return 3
+  return !anchored && target.endsWith('.' + domain) ? 1 : 0
+}
+
+function pathMatchRank(hostPath: string, query: UrlQuery) {
+  const slash = query.needle.indexOf('/')
+  const host = query.needle.slice(0, slash)
+  if (!host.includes('.')) return matchStrength(hostPath, query.needle)
+
+  const pathStart = hostPath.indexOf('/')
+  if (pathStart === -1) return 0
+  const hostRank = hostMatchRank(
+    hostPath.slice(0, pathStart),
+    host,
+    query.anchored
+  )
+  if (!hostRank) return 0
+  const pathRank = matchStrength(
+    hostPath.slice(pathStart),
+    query.needle.slice(slash)
+  )
+  return pathRank >= 2 ? (hostRank === 3 ? pathRank : 1) : 0
+}
+
 // Rank a pre-parsed record against the query (0 = no match). Mirrors
 // urlMatchesNormalizedUrl's matching, but reads the precomputed host parts
 // instead of re-deriving them, and returns a strength instead of a boolean.
 export function recordMatchRank(rec: UrlRecord, urlQuery: UrlQuery) {
   if (urlQuery.mode === 'path') {
-    return matchStrength(rec.hostPath, urlQuery.needle)
+    return pathMatchRank(rec.hostPath, urlQuery)
   }
   if (rec.isShared) return 0
-  const haystacks = urlQuery.matchFullHost
-    ? [rec.host, rec.compactHost]
-    : [rec.label, rec.compactLabel]
+  if (urlQuery.matchFullHost) {
+    return hostMatchRank(rec.host, urlQuery.needles[0], urlQuery.anchored)
+  }
+  const haystacks = [rec.label, rec.compactLabel]
   let best = 0
   for (const needle of urlQuery.needles) {
     // Anchored queries (typed scheme / www.) and short needles only accept
