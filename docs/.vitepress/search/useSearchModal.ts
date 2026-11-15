@@ -1,3 +1,4 @@
+import type { DefaultTheme } from 'vitepress'
 import type { ModalTranslations } from 'vitepress/types/local-search'
 import type { LocalSearchResult, SidebarItem } from './types'
 import localSearchIndex from '@localSearchIndex'
@@ -64,11 +65,19 @@ if (import.meta.hot) {
   })
 }
 
-// Persisted results state across mount/unmount of the modal
-let globalLastIndex: {
+type SearchSnapshot = {
   source: typeof searchIndexSource.value
   locale: string
-} | null = null
+  options: DefaultTheme.LocalSearchOptions['miniSearch']
+  engine: ReturnType<typeof createSearchEngine>
+}
+
+// Reuse parsed indexes and previews until their source, locale, or options change.
+let cachedSnapshot: SearchSnapshot | null = null
+let previewSnapshot: SearchSnapshot | null = null
+
+// Persisted results state across mount/unmount of the modal
+let globalLastIndex: SearchSnapshot | null = null
 
 const globalLastQuery = ref('')
 const globalLastFuzzy = ref(false)
@@ -197,13 +206,22 @@ export function useSearchModal() {
     el.scrollLeft += event.deltaY
   }
 
+  const miniSearchOptions = computed(() =>
+    theme.value.search?.provider === 'local'
+      ? theme.value.search.options?.miniSearch
+      : undefined
+  )
   const indexSnapshot = computedAsync(async () => {
     const source = searchIndexSource.value
     const locale = localeIndex.value
-    const options =
-      theme.value.search?.provider === 'local'
-        ? theme.value.search.options?.miniSearch
-        : undefined
+    const options = miniSearchOptions.value
+    if (
+      cachedSnapshot?.source === source &&
+      cachedSnapshot.locale === locale &&
+      cachedSnapshot.options === options
+    ) {
+      return cachedSnapshot
+    }
     const rawIndex = (await source[locale]?.())?.default
     if (!rawIndex) return null
     const loaded = loadSearchIndex(
@@ -212,22 +230,32 @@ export function useSearchModal() {
       options?.searchOptions
     )
     if (!loaded) return null
-    return markRaw({
+    const snapshot = markRaw({
       source,
       locale,
+      options,
       engine: createSearchEngine(
         loaded.index,
         loaded.metadata,
         Array.isArray(sidebar) ? sidebar : []
       )
     })
+    if (
+      source === searchIndexSource.value &&
+      locale === localeIndex.value &&
+      options === miniSearchOptions.value
+    ) {
+      cachedSnapshot = snapshot
+    }
+    return snapshot
   })
 
   // A superseded async load must never supply an index or metadata to this modal.
   const activeSnapshot = computed(() => {
     const snapshot = indexSnapshot.value
     return snapshot?.source === searchIndexSource.value &&
-      snapshot.locale === localeIndex.value
+      snapshot.locale === localeIndex.value &&
+      snapshot.options === miniSearchOptions.value
       ? snapshot
       : null
   })
@@ -287,6 +315,7 @@ export function useSearchModal() {
       inBrowser &&
       globalLastIndex?.source === searchIndexSource.value &&
       globalLastIndex.locale === localeIndex.value &&
+      globalLastIndex.options === miniSearchOptions.value &&
       filterText.value === globalLastQuery.value &&
       isFuzzySearch.value === globalLastFuzzy.value &&
       isUrlSearch.value === globalLastUrlSearch.value &&
@@ -347,7 +376,7 @@ export function useSearchModal() {
 
   // Invalidate restored results immediately, even while a new locale/index loads.
   watch(
-    [searchIndexSource, localeIndex],
+    [searchIndexSource, localeIndex, miniSearchOptions],
     () => {
       excerptCache.clear()
       allResults.value = []
@@ -365,10 +394,16 @@ export function useSearchModal() {
     { flush: 'sync' }
   )
 
-  watch(activeSnapshot, () => excerptCache.clear(), {
-    immediate: true,
-    flush: 'sync'
-  })
+  watch(
+    activeSnapshot,
+    (snapshot) => {
+      if (snapshot && snapshot !== previewSnapshot) {
+        excerptCache.clear()
+        previewSnapshot = snapshot
+      }
+    },
+    { immediate: true, flush: 'sync' }
+  )
 
   // Query the index after typing pauses; pagination and previews are handled below.
   watchDebounced(
@@ -380,9 +415,8 @@ export function useSearchModal() {
         isUrlSearch.value,
         showDetailedList.value
       ] as const,
-    ([snapshot, filterTextValue], old) => {
-      const snapshotChanged = old && old[0] !== undefined && old[0] !== snapshot
-      if (!snapshotChanged && matchesGlobalState()) {
+    ([snapshot, filterTextValue]) => {
+      if (snapshot === globalLastIndex && matchesGlobalState()) {
         queriedSnapshot = snapshot
         usedSubstringExpansion.value = globalUsedSubstringExpansion.value
         allResults.value = globalAllResults.value
@@ -486,7 +520,7 @@ export function useSearchModal() {
           globalResults.value = []
           globalTotalResultsCount.value = 0
           globalMayHaveMore.value = false
-          globalLastIndex = { source: snapshot.source, locale: snapshot.locale }
+          globalLastIndex = snapshot
         }
         if (resultSetChanged) {
           categoryCounts.value = computeCategoryCounts(allRes)
@@ -664,7 +698,7 @@ export function useSearchModal() {
 
       // Only completed results may be restored after the modal unmounts.
       if (!snapshot || queriedSnapshot !== snapshot) return
-      globalLastIndex = { source: snapshot.source, locale: snapshot.locale }
+      globalLastIndex = snapshot
       globalResults.value = finalResults
       globalTotalResultsCount.value = totalCount
       globalResultLimit.value = limit
