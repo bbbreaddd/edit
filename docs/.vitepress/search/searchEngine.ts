@@ -88,7 +88,7 @@ function fuzzyTolerance(term: string) {
 }
 
 function headingWordStem(term: string) {
-  const stem = term.replace(/(?:ors?|ing|ions?)$/, '')
+  const stem = term.replace(/(?:ors?|ers?|ing|ions?)$/, '')
   return stem.length >= 4 &&
     stem !== term &&
     (!/ions?$/.test(term) || stem.endsWith('at'))
@@ -157,10 +157,18 @@ function createTermLookup(terms: string[], metadata: SearchMetadata) {
     recognizes,
     aliases,
     headingForms(word: string) {
-      if (!/(?:ors?|ions?)$/.test(word)) return []
+      if (!/(?:ors?|ers?|ing|ions?)$/.test(word)) return []
       const stem = headingWordStem(word)
       if (!stem) return []
-      const forms = [`${stem}or`, `${stem}ors`, `${stem}ing`]
+      const forms = [
+        stem,
+        `${stem}e`,
+        `${stem}or`,
+        `${stem}ors`,
+        `${stem}er`,
+        `${stem}ers`,
+        `${stem}ing`
+      ]
       if (stem.endsWith('at')) forms.push(`${stem}ion`, `${stem}ions`)
       return forms.filter(
         (term) => !term.startsWith(word) && indexedTerms.has(term)
@@ -332,7 +340,9 @@ function runSearch(
   sidebar: SidebarItem[],
   phraseCache: Map<string, CachedLinkPhrase>,
   getUrlIndex: () => UrlRecord[],
-  getTermLookup: () => ReturnType<typeof createTermLookup>
+  getTermLookup: () => ReturnType<typeof createTermLookup>,
+  entryResults = false,
+  sectionOrder = new Map<string, number>()
 ) {
   const parsed = parseSearchQuery(filterTextValue)
   const { text, isPhrase, sites, titles, urls, branches } = parsed
@@ -348,7 +358,9 @@ function runSearch(
           sidebar,
           phraseCache,
           getUrlIndex,
-          getTermLookup
+          getTermLookup,
+          entryResults,
+          sectionOrder
         ).results
     )
     const merged = new Map<string, LocalSearchResult>()
@@ -378,7 +390,12 @@ function runSearch(
         }
       }
     }
-    return { results: [...merged.values()].slice(0, MAX_RESULTS_IN_MEMORY) }
+    return {
+      results: [...merged.values()].slice(
+        0,
+        entryResults ? index.documentCount : MAX_RESULTS_IN_MEMORY
+      )
+    }
   }
   filterTextValue = text
   const siteMatches = sites.length
@@ -569,7 +586,7 @@ function runSearch(
     fuzzy &&
     !entryPhraseGroups.length &&
     !looksLikeUrlQuery(filterTextValue) &&
-    tokenizeIndexLike(filterTextValue).length > 1
+    (entryResults || tokenizeIndexLike(filterTextValue).length > 1)
   const matchesWithoutTerms =
     fuzzy &&
     (parsed.excludedTerms.length ||
@@ -656,7 +673,13 @@ function runSearch(
         titles.unshift(pageTitle)
       }
 
-      return { ...r, titles }
+      return {
+        ...r,
+        titles,
+        indexedTitles: [...r.titles],
+        pageTitle: pageTitle ?? '',
+        sectionOrder: sectionOrder.get(r.id) ?? 0
+      }
     })
     .filter(
       (result) =>
@@ -903,10 +926,13 @@ function runSearch(
         (q && r.urlMatched && !Object.keys(r.match).length)
           ? {
               groups: entryPhraseGroups,
+              resourceContext: entryResults,
               withHeadingContext,
               // Use the indexed hierarchy, excluding sidebar display labels.
               headings: withHeadingContext
-                ? headingAlternatives.size || r.id.startsWith('/non-english#')
+                ? entryResults ||
+                  headingAlternatives.size ||
+                  r.id.startsWith('/non-english#')
                   ? [...indexedTitles, r.title]
                   : [r.title]
                 : [r.title, ...indexedTitles],
@@ -986,7 +1012,10 @@ function runSearch(
   })
 
   return {
-    results: boostedResults.slice(0, MAX_RESULTS_IN_MEMORY)
+    results: boostedResults.slice(
+      0,
+      entryResults ? index.documentCount : MAX_RESULTS_IN_MEMORY
+    )
   }
 }
 
@@ -1211,18 +1240,27 @@ export function loadSearchIndex(
 export function createSearchEngine(
   index: MiniSearch<Result>,
   metadata: SearchMetadata,
-  sidebar: SidebarItem[] = []
+  sidebar: SidebarItem[] = [],
+  entryResults = false
 ) {
   // Upgrade-sensitive MiniSearch internal: recheck substring expansion after upgrades.
   // MiniSearch has no public term iterator; keep this compatibility access local.
   const internal = index as unknown as { _index?: Map<string, unknown> }
   const terms = internal._index ? [...internal._index.keys()] : []
+  const sectionOrder = new Map(
+    index
+      .search(MiniSearch.wildcard, { boostDocument: undefined })
+      .map((result, ordinal) => [result.id as string, ordinal])
+  )
   const phraseCache = new Map<string, CachedLinkPhrase>()
   let urlIndex: UrlRecord[] | undefined
   let links: ReturnType<typeof collectLinkTerms> | undefined
   let termLookup: ReturnType<typeof createTermLookup> | undefined
   const getTermLookup = () => (termLookup ??= createTermLookup(terms, metadata))
   return {
+    headingForms(word: string) {
+      return getTermLookup().headingForms(word)
+    },
     search(query: string, options: { fuzzy: boolean; urls: boolean }) {
       return runSearch(
         index,
@@ -1233,7 +1271,9 @@ export function createSearchEngine(
         sidebar,
         phraseCache,
         () => (urlIndex ??= buildUrlIndex(metadata)),
-        getTermLookup
+        getTermLookup,
+        entryResults,
+        sectionOrder
       )
     },
     suggest(query: string) {

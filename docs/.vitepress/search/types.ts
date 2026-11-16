@@ -3,6 +3,9 @@ import type { SearchResult } from 'minisearch'
 export interface Result {
   title: string
   titles: string[]
+  indexedTitles?: string[]
+  pageTitle?: string
+  sectionOrder?: number
   text?: string
   urlMatched?: boolean
   urlMatchedStarred?: boolean
@@ -40,6 +43,7 @@ export type LocalSearchResult = SearchResult &
     ) => boolean
     entryMatch?: {
       groups: string[][]
+      resourceContext?: boolean
       withHeadingContext?: boolean
       headings?: string[]
       auxiliary: string[]

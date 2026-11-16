@@ -188,23 +188,28 @@ export function getSearchEntryText(entry: Element): string {
   return own.textContent?.trim() ?? ''
 }
 
-export function preferredEntryMark(
+export function preferredEntryTarget(
   marks: HTMLElement[],
-  result: LocalSearchResult
+  result: LocalSearchResult,
+  root?: Element | null
 ) {
   const preferred = result.entryMatch?.entries?.[0]
-  return (
-    (preferred && !preferred.heading
-      ? marks.find((mark) => {
-          const entry = mark.closest(SEARCH_ENTRY_SELECTOR)
-          return (
-            entry &&
-            normalizeExcerptText(getSearchEntryText(entry)) ===
-              normalizeExcerptText(preferred.context)
-          )
-        })
-      : undefined) ?? marks[0]
-  )
+  if (!preferred || preferred.heading) return marks[0]
+  const context = normalizeExcerptText(preferred.context)
+  const matchesEntry = (entry: Element) =>
+    normalizeExcerptText(getSearchEntryText(entry)) === context
+  const marked = marks.find((mark) => {
+    const entry = mark.closest(SEARCH_ENTRY_SELECTOR)
+    return entry && matchesEntry(entry)
+  })
+  if (marked) return marked
+  if (result.entryMatch?.resourceContext)
+    return (
+      [
+        ...(root?.querySelectorAll<HTMLElement>(SEARCH_ENTRY_SELECTOR) ?? [])
+      ].find(matchesEntry) ?? marks[0]
+    )
+  return marks[0]
 }
 
 export async function highlightSearchResults(

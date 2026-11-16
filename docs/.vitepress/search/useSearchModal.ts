@@ -1,6 +1,6 @@
 import type { DefaultTheme } from 'vitepress'
 import type { ModalTranslations } from 'vitepress/types/local-search'
-import type { LocalSearchResult, SidebarItem } from './types'
+import type { LocalSearchResult, SearchMetadata, SidebarItem } from './types'
 import localSearchIndex from '@localSearchIndex'
 import {
   computedAsync,
@@ -34,7 +34,7 @@ import {
   groupMarks,
   highlightSearchResults,
   mergeNearbyMarks,
-  preferredEntryMark,
+  preferredEntryTarget,
   SEARCH_ENTRY_SELECTOR
 } from './matchHighlighting'
 import { INVISIBLE_CHARS_RE, parseSearchQuery } from './normalization'
@@ -43,7 +43,8 @@ import {
   excerptCache,
   filterResults,
   loadExcerpts,
-  lookupExcerptText
+  lookupExcerptText,
+  refineSearchEntries
 } from './resultPreviews'
 import { createSearchEngine, loadSearchIndex } from './searchEngine'
 import { isExplicitUrlQuery, looksLikeUrlQuery } from './urlMatching'
@@ -65,6 +66,7 @@ type SearchSnapshot = {
   source: typeof searchIndexSource.value
   locale: string
   options: DefaultTheme.LocalSearchOptions['miniSearch']
+  metadata: SearchMetadata
   engine: ReturnType<typeof createSearchEngine>
 }
 
@@ -229,6 +231,7 @@ export function useSearchModal() {
       source,
       locale,
       options,
+      metadata: loaded.metadata,
       engine: createSearchEngine(
         loaded.index,
         loaded.metadata,
@@ -530,7 +533,14 @@ export function useSearchModal() {
       const literalQuery = searchQuery.text
         .replace(INVISIBLE_CHARS_RE, '')
         .toLowerCase()
+      const useEntrySearch =
+        fuzzy &&
+        !searchQuery.phrases.length &&
+        !searchQuery.branches.length &&
+        !!searchQuery.text &&
+        !looksLikeUrlQuery(searchQuery.text)
       const needsContentFiltering =
+        useEntrySearch ||
         hasExclusions ||
         allRes.some(
           (result) =>
@@ -561,6 +571,7 @@ export function useSearchModal() {
       )
       const previewCandidates = candidates.filter(
         (result, index) =>
+          useEntrySearch ||
           (needsPreviewFiltering && !knownMatches.has(result.id)) ||
           (showDetailedListValue && index < limit)
       )
@@ -571,9 +582,19 @@ export function useSearchModal() {
         ...result,
         text: includeExcerpts ? lookupExcerptText(result.id) : ''
       }))
-      const filtered = needsPreviewFiltering
-        ? filterResults(mapped, query, true, fuzzy)
-        : mapped
+      const filtered =
+        useEntrySearch && snapshot
+          ? refineSearchEntries(
+              mapped,
+              query,
+              { fuzzy, urls },
+              snapshot.metadata,
+              Array.isArray(sidebar) ? sidebar : [],
+              snapshot.engine.headingForms
+            )
+          : needsPreviewFiltering
+            ? filterResults(mapped, query, true, fuzzy)
+            : mapped
       const scopedMatches = category
         ? filtered.filter((result) => resultCategoryOf(result.id) === category)
         : filtered
@@ -637,7 +658,7 @@ export function useSearchModal() {
           ...excerpt.querySelectorAll<HTMLElement>('mark[data-markjs="true"]')
         ]
         const markElement = result
-          ? preferredEntryMark(marks, result)
+          ? preferredEntryTarget(marks, result, excerpt)
           : marks[0]
         if (markElement) {
           const markRelTop = getRelativeOffsetTop(markElement, excerpt)
@@ -665,9 +686,16 @@ export function useSearchModal() {
         const marks = Array.from(
           item?.querySelectorAll('.excerpt mark[data-markjs="true"]') ?? []
         ) as HTMLElement[]
-        if (marks.length > 0) {
+        const preferred = preferredEntryTarget(
+          marks,
+          r,
+          item?.querySelector('.excerpt')
+        )
+        if (marks.length > 0 || preferred) {
           const groups = groupMarks(marks)
-          const preferred = preferredEntryMark(marks, r)
+          // A heading-supported resource may have no literal query word to mark.
+          if (preferred && !marks.includes(preferred))
+            groups.unshift([preferred])
           const current = groups.findIndex(
             (group) => preferred && group.includes(preferred)
           )

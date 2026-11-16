@@ -1,6 +1,13 @@
 import type { useData } from 'vitepress/dist/client/theme-default/composables/data'
 import type { Component, Slots } from 'vue'
-import type { LocalSearchResult, SearchEntryMatch } from './types'
+import type {
+  LocalSearchResult,
+  Result,
+  SearchEntryMatch,
+  SearchMetadata,
+  SidebarItem
+} from './types'
+import MiniSearch from 'minisearch'
 import { dataSymbol } from 'vitepress'
 import { pathToFile } from 'vitepress/dist/client/app/utils'
 import { createApp, h } from 'vue'
@@ -10,15 +17,19 @@ import { SEARCH_ENTRY_SELECTOR } from './matchHighlighting'
 import {
   createPhraseRegex,
   normalizeSearchText as normalizeExcerptText,
+  normalizeFuzzyTerm,
   normalizeSearchUrl,
   normalizeUrlFilters,
   parseSearchQuery,
-  tokenizeIndexLike
+  processSearchTerm,
+  tokenizeIndexLike,
+  tokenizeSearchText
 } from './normalization'
-import { mergeSearchMatches } from './searchEngine'
+import { createSearchEngine, mergeSearchMatches } from './searchEngine'
 import {
   buildUrlQuery,
   createSiteMatcher,
+  looksLikeUrlQuery,
   normalizeUrlSearchValue,
   urlMatchesNormalizedUrl
 } from './urlMatching'
@@ -459,6 +470,7 @@ function filterQueryResults(
           !urlMatched &&
           ((result.entryMatch.withHeadingContext &&
             !hasEntryFilters &&
+            !result.entryMatch.resourceContext &&
             !result.terms.some((term) => ownTerms.has(term))) ||
             !result.matchesWithoutTerms?.(
               new Set(result.terms.filter((term) => !present.has(term))),
@@ -501,7 +513,10 @@ function filterQueryResults(
           element.closest('li')?.classList.contains('starred') ||
           !!own.querySelector('.starred')
         // Auxiliary link matches do not inherit the resource's star.
-        const rank = primary || descriptive ? (starred ? 2 : 1) : 0
+        const headingSupported =
+          result.entryMatch.resourceContext && !phrases.length
+        const rank =
+          primary || descriptive || headingSupported ? (starred ? 2 : 1) : 0
         if (
           !entries.some(
             (entry) =>
@@ -661,4 +676,500 @@ function filterQueryResults(
     }),
     excludedEntries
   }
+}
+
+interface ResourceEntry {
+  id: string
+  section: LocalSearchResult
+  html: string
+  body: string
+  description: string
+  indexText: string
+  order: number
+  names: string[]
+  starred: boolean
+  reference: boolean
+  aliases: string[]
+}
+
+// Search individual authored entries, then group them back into navigable sections.
+export function refineSearchEntries(
+  sections: LocalSearchResult[],
+  query: string,
+  options: { fuzzy: boolean; urls: boolean },
+  metadata: SearchMetadata,
+  sidebar: SidebarItem[],
+  wordForms: (word: string) => string[]
+): LocalSearchResult[] {
+  const parsed = parseSearchQuery(query)
+  // Literal and operator branches already have their own entry qualification/order.
+  if (
+    !options.fuzzy ||
+    parsed.phrases.length ||
+    parsed.branches.length ||
+    !parsed.text ||
+    looksLikeUrlQuery(parsed.text)
+  )
+    return filterResults(sections, query, true, options.fuzzy)
+
+  if (parsed.excludedTerms.length || parsed.excludedSites.length) {
+    sections = filterQueryResults(
+      sections.map((section) => ({ ...section, entryMatch: undefined })),
+      {
+        ...parsed,
+        text: '',
+        unquotedText: '',
+        phrases: [],
+        sites: [],
+        urls: [],
+        titles: [],
+        branches: [],
+        isPhrase: false
+      },
+      true,
+      true
+    ).results
+  }
+
+  const normalize = (text: string) =>
+    normalizeFuzzyTerm(normalizeExcerptText(text))
+  const pageAlias = (section: LocalSearchResult) => {
+    const page = section.id.split('#')[0]
+    const words = tokenizeIndexLike(
+      (section.pageTitle ?? '').replace(/<[^>]*>/g, ' ')
+    )
+    const initials = words.map((word) => word[0]).join('')
+    return words.length > 1 && page.split('/').at(-1) === initials
+      ? initials
+      : ''
+  }
+  const entries: ResourceEntry[] = []
+  const entryMetadata: SearchMetadata = {}
+  const template = document.createElement('template')
+  for (const section of sections) {
+    const firstEntry = entries.length
+    const aliases = [
+      ...new Set(
+        [section.title, ...(section.indexedTitles ?? [])]
+          .flatMap((title) => tokenizeIndexLike(title).flatMap(wordForms))
+          .concat(pageAlias(section))
+          .filter(Boolean)
+      )
+    ]
+    template.innerHTML = section.text ?? ''
+    const elements = [
+      ...template.content.querySelectorAll(SEARCH_ENTRY_SELECTOR)
+    ].filter(
+      (element) =>
+        element.tagName === 'LI' ||
+        !element.parentElement?.closest(SEARCH_ENTRY_SELECTOR)
+    )
+    if (!elements.length) elements.push(...template.content.children)
+    for (const [ordinal, element] of elements.entries()) {
+      const own = element.cloneNode(true) as Element
+      own.querySelectorAll('ul, ol').forEach((list) => list.remove())
+      // Warning prose is searchable; hidden source citations are not resource links.
+      own
+        .querySelectorAll('.critical-badge-hidden-body a, .tooltip-source-link')
+        .forEach((link) => link.replaceWith(link.textContent ?? ''))
+      const body = own.textContent ?? ''
+      if (!normalizeExcerptText(body)) continue
+      let descriptionStart = body.length
+      const walker = document.createTreeWalker(own, NodeFilter.SHOW_TEXT)
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        if (node.parentElement?.closest('a,code,pre')) continue
+        const separator = node.textContent?.match(/\s[-–—]\s/)
+        if (!separator) continue
+        const range = document.createRange()
+        range.selectNodeContents(own)
+        range.setEnd(node, separator.index!)
+        descriptionStart = range.toString().length
+        break
+      }
+      let primarySeen = false
+      let previousEnd = 0
+      const links = [...own.querySelectorAll('a[href]')].map((link) => {
+        const range = document.createRange()
+        range.selectNodeContents(own)
+        range.setEndBefore(link)
+        const start = range.toString().length
+        const label = link.textContent ?? ''
+        const bold = !!(
+          link.closest('strong,b') || link.querySelector('strong,b')
+        )
+        const primary =
+          !!normalizeExcerptText(label) &&
+          start < descriptionStart &&
+          (bold ||
+            !primarySeen ||
+            /\bor\b|,\s*$/i.test(body.slice(previousEnd, start))) &&
+          (!primarySeen || !/^\d+$/.test(label.trim()))
+        if (primary) primarySeen = true
+        previousEnd = start + label.length
+        return {
+          label,
+          primary,
+          bold,
+          start,
+          end: previousEnd,
+          href: link.getAttribute('href') ?? ''
+        }
+      })
+      const starred =
+        own.classList.contains('starred') ||
+        !!own.querySelector('.i-twemoji-star.starred')
+      const names = links
+        .filter((link) => link.primary)
+        .map((link) => normalizeExcerptText(link.label))
+      const urls = links.flatMap((link) => {
+        if (!/^(?:[a-z][a-z0-9+.-]*:\/\/|www\.)/i.test(link.href)) return []
+        const url = normalizeSearchUrl(
+          normalizeUrlSearchValue(link.href)
+        ).slice(0, 80)
+        return metadata[section.id]?.u?.includes(url)
+          ? [{ url, primary: link.primary }]
+          : []
+      })
+      const id = section.id + '~entry-' + ordinal
+      entryMetadata[id] = {
+        l: links
+          .map((link) => normalizeExcerptText(link.label))
+          .filter(Boolean),
+        s: starred
+          ? links
+              .filter((link) => link.primary && link.bold)
+              .map((link) => normalizeExcerptText(link.label))
+          : [],
+        a: links
+          .filter((link) => !link.primary)
+          .map((link) => normalizeExcerptText(link.label))
+          .filter((label) => !names.includes(label)),
+        u: urls.map((link) => link.url),
+        su: starred
+          ? urls.filter((link) => link.primary).map((link) => link.url)
+          : []
+      }
+      let description = body.slice(descriptionStart)
+      for (const link of [...links].reverse())
+        if (!link.primary && link.start >= descriptionStart)
+          description =
+            description.slice(0, link.start - descriptionStart) +
+            ' '.repeat(link.end - link.start) +
+            description.slice(link.end - descriptionStart)
+      entries.push({
+        id,
+        section,
+        html: own.outerHTML,
+        body,
+        description,
+        indexText: body + ' ' + collectIconLabels(own),
+        order: entries.length,
+        names,
+        starred,
+        reference: !!own.querySelector('.i-twemoji-repeat-button'),
+        aliases
+      })
+    }
+    if (entries.length === firstEntry) {
+      const id = section.id + '~heading'
+      entryMetadata[id] = {}
+      entries.push({
+        id,
+        section,
+        html: '',
+        body: '',
+        description: '',
+        indexText: '',
+        order: entries.length,
+        names: [],
+        starred: false,
+        reference: true,
+        aliases
+      })
+    }
+  }
+  if (!entries.length) return []
+  const byId = new Map(entries.map((entry) => [entry.id, entry]))
+  const index = new MiniSearch<Result>({
+    fields: ['title', 'titles', 'text'],
+    storeFields: ['title', 'titles'],
+    tokenize: tokenizeSearchText,
+    processTerm: processSearchTerm,
+    searchOptions: {
+      prefix: true,
+      combineWith: 'AND',
+      boostDocument: (id, term, fields) => {
+        const titles = (fields?.titles ?? []) as string[]
+        const level = titles.findIndex((title) =>
+          title.toLowerCase().includes(term)
+        )
+        return (
+          (level >= 0 ? 10000 - level : 1) *
+          (/\/(posts|other)/.test(String(id)) ? 0.1 : 1)
+        )
+      }
+    }
+  })
+  index.addAll(
+    entries.map((entry) => ({
+      id: entry.id,
+      title: entry.section.title,
+      titles: [...(entry.section.indexedTitles ?? []), ...entry.aliases],
+      text: entry.indexText
+    }))
+  )
+  const engine = createSearchEngine(index, entryMetadata, sidebar, true)
+  const candidates = engine.search(query, options).results.map((result) => {
+    const entry = byId.get(result.id)!
+    return {
+      ...result,
+      text: entry.html,
+      entryMatch: result.entryMatch
+        ? {
+            ...result.entryMatch,
+            headings: [...(result.entryMatch.headings ?? []), ...entry.aliases]
+          }
+        : undefined
+    }
+  })
+  let matches = filterResults(candidates, query, true, true)
+  const words = tokenizeIndexLike(parsed.text)
+  const normalizedQuery = normalize(parsed.text)
+  const single = words.length === 1
+  const wholeName = matches.some((result) =>
+    entryMetadata[result.id].s?.some(
+      (name) => normalize(name) === normalizedQuery
+    )
+  )
+  const canonicalForms =
+    single && /^[a-z]{2,4}$/i.test(words[0]) && !wholeName
+      ? [
+          ...new Set(
+            matches.flatMap((result) =>
+              (entryMetadata[result.id].s ?? [])
+                .flatMap((name) => tokenizeIndexLike(name, true))
+                .filter((word) => normalize(word) === normalizedQuery)
+            )
+          )
+        ]
+      : []
+  if (canonicalForms.length)
+    matches = matches.filter((result) => {
+      const entry = byId.get(result.id)!
+      return (
+        result.urlMatchRank === 3 ||
+        pageAlias(entry.section) === normalizedQuery ||
+        canonicalForms.some((form) =>
+          [
+            entry.body,
+            entry.section.title,
+            ...(entry.section.indexedTitles ?? [])
+          ].some((text) => createPhraseRegex(form).test(text))
+        )
+      )
+    })
+  const lookup =
+    single &&
+    matches.some(
+      (result) =>
+        !byId.get(result.id)!.reference &&
+        entryMetadata[result.id].s?.some(
+          (name) =>
+            normalize(name) === normalizedQuery ||
+            (words[0].length <= 4 &&
+              tokenizeIndexLike(name, true).some(
+                (word) => normalize(word) === normalizedQuery
+              ))
+        )
+    )
+  const topicForms = (word: string) => {
+    const forms = [normalize(word)]
+    if (word.endsWith('s') && !word.endsWith('ss'))
+      forms.push(normalize(word.slice(0, -1)))
+    if (word.endsWith('ing') && word.length > 5)
+      forms.push(
+        normalize(word.slice(0, -3)),
+        normalize(word.slice(0, -3) + 'e')
+      )
+    return forms
+  }
+  const topicStrength = (section: LocalSearchResult) => {
+    if (!single) return 0
+    const page = section.id.split('#')[0].split('/').at(-1)!
+    const subject = tokenizeIndexLike(
+      (section.pageTitle ?? '').replace(/<[^>]*>/g, '').split('/')[0]
+    )[0]
+    const forms = topicForms(words[0])
+    if (
+      pageAlias(section) === words[0] ||
+      (!page.includes('-') &&
+        topicForms(page).some((form) => forms.includes(form)))
+    )
+      return 2
+    return subject && topicForms(subject).some((form) => forms.includes(form))
+      ? 1
+      : 0
+  }
+  const topic = matches.some(
+    (result) => topicStrength(byId.get(result.id)!.section) > 0
+  )
+  const headingCoverage = (entry: ResourceEntry) => {
+    const own = tokenizeIndexLike(entry.section.title)
+    const context = [
+      ...own,
+      ...tokenizeIndexLike((entry.section.indexedTitles ?? []).join(' ')),
+      ...entry.aliases
+    ]
+    const covered =
+      words.length > 1 &&
+      words.every((word) => context.some((term) => term.startsWith(word)))
+    const roles = words.filter((word) => /(?:ors?|ers?)$/.test(word))
+    const ownRole = roles.some((word) =>
+      [...own, ...own.flatMap(wordForms)].some((term) => term.startsWith(word))
+    )
+    return {
+      role: covered && roles.length > 0,
+      rank: covered ? (ownRole ? 2 : 1) : 0
+    }
+  }
+  const task = matches.some(
+    (result) => headingCoverage(byId.get(result.id)!).role
+  )
+  const quality = new Map<string, number[]>()
+  for (const result of matches) {
+    const entry = byId.get(result.id)!
+    const names = entry.names.map(normalize)
+    const forms = [
+      normalizedQuery,
+      ...(result.entryMatch?.groups ?? []).flat().map(normalize)
+    ]
+    const statusName = /^\/(?:unsafe|recently-removed)#/.test(entry.section.id)
+      ? normalize(entry.body.split(/\s[-–—]\s/)[0])
+      : ''
+    const exact =
+      names.some((name) => forms.includes(name)) ||
+      !!(statusName && forms.includes(statusName))
+    const nameMatch = names.some((name) =>
+      forms.some((form) => createPhraseRegex(form).test(name))
+    )
+      ? 2
+      : names.some((name) => name.startsWith(normalizedQuery))
+        ? 1
+        : 0
+    const evidence = result.entryMatch?.entries ?? []
+    const auxiliary =
+      evidence.length > 0 &&
+      evidence.every((match) => !match.heading && match.rank === 0)
+    const curated = entry.starred && !auxiliary
+    const reference = entry.reference
+    const active = !/^\/recently-removed(?:\.html)?#/.test(entry.section.id)
+    const headingRank = headingCoverage(entry).rank
+    const direct =
+      result.terms.some((term) => forms.includes(normalize(term))) && !auxiliary
+    const unsafe =
+      entry.section.id.startsWith('/unsafe#') && statusName === normalizedQuery
+    const referenceMaterial =
+      !words.some((word) =>
+        /^(?:guides?|tutorials?|forums?|subreddit|wiki|documentation)$/.test(
+          word
+        )
+      ) &&
+      /\b(?:guides?|tutorials?|forums?|subreddit|wiki|documentation)\b/i.test(
+        entry.description.split('/')[0]
+      )
+    let rank = single
+      ? [
+          unsafe,
+          direct,
+          exact && !reference,
+          active,
+          !reference,
+          nameMatch,
+          curated
+        ]
+      : [
+          unsafe,
+          exact && !reference,
+          active,
+          !reference,
+          headingRank,
+          curated,
+          nameMatch
+        ]
+    if (task)
+      rank = [
+        unsafe,
+        active,
+        !reference,
+        !referenceMaterial,
+        headingRank,
+        curated,
+        exact && !reference,
+        nameMatch
+      ]
+    if (topic || (single && !lookup))
+      rank = [unsafe, active, !reference, curated]
+    quality.set(result.id, rank.map(Number))
+  }
+  const sectionOrder = new Map(
+    sections.map((section, ordinal) => [section.id, ordinal])
+  )
+  matches.sort((a, b) => {
+    const left = quality.get(a.id)!,
+      right = quality.get(b.id)!
+    for (let i = 0; i < left.length; i++)
+      if (left[i] !== right[i]) return right[i] - left[i]
+    const x = byId.get(a.id)!,
+      y = byId.get(b.id)!
+    return (
+      sectionOrder.get(x.section.id)! - sectionOrder.get(y.section.id)! ||
+      x.order - y.order
+    )
+  })
+  const grouped = new Map<string, LocalSearchResult>()
+  for (const match of matches) {
+    const entry = byId.get(match.id)!
+    const previous = grouped.get(entry.section.id)
+    if (previous) {
+      const merged = mergeSearchMatches(previous, match)
+      grouped.set(entry.section.id, {
+        ...merged,
+        id: entry.section.id,
+        entryMatch: previous.entryMatch
+          ? {
+              ...previous.entryMatch,
+              entries: [
+                ...(previous.entryMatch.entries ?? []),
+                ...(match.entryMatch?.entries ?? [])
+              ]
+            }
+          : match.entryMatch
+      })
+    } else
+      grouped.set(entry.section.id, {
+        ...entry.section,
+        ...match,
+        id: entry.section.id,
+        title: entry.section.title,
+        titles: entry.section.titles,
+        indexedTitles: entry.section.indexedTitles,
+        pageTitle: entry.section.pageTitle,
+        sectionOrder: entry.section.sectionOrder,
+        text: entry.section.text
+      })
+  }
+  const results = [...grouped.values()]
+  if (topic)
+    results.sort(
+      (a, b) =>
+        topicStrength(b) - topicStrength(a) ||
+        (topicStrength(a) > 0
+          ? Number(!a.entryMatch?.entries?.some((entry) => !entry.heading)) -
+              Number(!b.entryMatch?.entries?.some((entry) => !entry.heading)) ||
+            (a.sectionOrder ?? 0) - (b.sectionOrder ?? 0)
+          : sectionOrder.get(a.id)! - sectionOrder.get(b.id)!)
+    )
+  else if (single && !lookup)
+    results.sort((a, b) => sectionOrder.get(a.id)! - sectionOrder.get(b.id)!)
+  return results
 }
