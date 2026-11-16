@@ -199,14 +199,15 @@ export function preferredEntryTarget(
   const matchesEntry = (entry: Element) =>
     normalizeExcerptText(getSearchEntryText(entry)) === context
   const marked = marks.find((mark) => {
-    const entry = mark.closest(SEARCH_ENTRY_SELECTOR)
+    const entry =
+      mark.closest('[data-search-entry]') ?? mark.closest(SEARCH_ENTRY_SELECTOR)
     return entry && matchesEntry(entry)
   })
   if (marked) return marked
   if (result.entryMatch?.resourceContext)
     return (
       [
-        ...(root?.querySelectorAll<HTMLElement>(SEARCH_ENTRY_SELECTOR) ?? [])
+        ...(root?.querySelectorAll<HTMLElement>('[data-search-entry]') ?? [])
       ].find(matchesEntry) ?? marks[0]
     )
   return marks[0]
@@ -285,7 +286,9 @@ export async function highlightSearchResults(
                     normalizeExcerptText(heading)
                   )
                 )
-              const entry = element?.closest(SEARCH_ENTRY_SELECTOR)
+              const entry =
+                element?.closest('[data-search-entry]') ??
+                element?.closest(SEARCH_ENTRY_SELECTOR)
               if (!entry) return false
               let text = entryTexts.get(entry)
               if (text === undefined) {

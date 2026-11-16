@@ -308,6 +308,12 @@ const renderedResults = computed(() =>
                         </a>
                       </span>
                     </div>
+                    <p
+                      v-if="showDetailedList && p.headingSupported"
+                      class="section-match-label"
+                    >
+                      {{ customTitles.sectionMatch }}
+                    </p>
                     <div v-if="showDetailedList" class="excerpt-wrapper">
                       <div v-if="p.text" class="excerpt" inert>
                         <div class="vp-doc" v-html="p.textHtml" />
@@ -835,6 +841,12 @@ const renderedResults = computed(() =>
 .result.selected {
   --vp-local-search-result-bg: var(--vp-local-search-result-selected-bg);
   border-color: var(--vp-local-search-result-selected-border);
+}
+
+.section-match-label {
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--vp-c-text-2);
 }
 
 .excerpt-wrapper {

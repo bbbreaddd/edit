@@ -2,7 +2,10 @@ import type { AsPlainObject, Options, Query, SearchOptions } from 'minisearch'
 import type {
   LocalSearchResult,
   Result,
+  SearchEntryFields,
+  SearchMatchEvidence,
   SearchMetadata,
+  SearchTermMatch,
   SidebarItem
 } from './types'
 import type { UrlRecord } from './urlMatching'
@@ -28,6 +31,13 @@ import {
 export const MAX_RESULTS_IN_MEMORY = 200
 const MAX_SUBSTRING_TERMS = 100
 const MAX_SUGGESTIONS = 3
+const RECOVERY_ORDER = {
+  literal: 0,
+  folded: 1,
+  compound: 2,
+  typo: 3,
+  heading: 4
+} as const
 
 interface BoostFlags {
   hasStarredExact: boolean
@@ -311,6 +321,14 @@ export function mergeSearchMatches(
       (a.entryMatch?.entries?.[0]?.rank ?? -1)
         ? b.entryMatch
         : (a.entryMatch ?? b.entryMatch),
+    termMatches: [
+      ...new Map(
+        [...(a.termMatches ?? []), ...(b.termMatches ?? [])].map((match) => [
+          match.query + '\0' + match.term,
+          match
+        ])
+      ).values()
+    ],
     terms: [...new Set([...a.terms, ...b.terms])],
     queryTerms: [...new Set([...a.queryTerms, ...b.queryTerms])],
     match,
@@ -808,6 +826,84 @@ function runSearch(
     return headingWords.every((word) => keys.has(word))
   }
   const headingStems = new Set([...headingAlternatives].map(headingWordStem))
+  const termMatches = new Map<string, SearchTermMatch>()
+  const describeTerm = (term: string): SearchTermMatch => {
+    const cached = termMatches.get(term)
+    if (cached) return cached
+    const words = [...originalTerms]
+    const literal =
+      words.find((word) => term === word) ??
+      words.find((word) => term.startsWith(word)) ??
+      words.find((word) => term.includes(word))
+    const recovered = words.flatMap((word) =>
+      (recoveredTerms.get(word) ?? [])
+        .filter((form) => term.startsWith(form))
+        .map((form) => ({ word, form }))
+    )
+    const folded = recovered.find(
+      ({ word, form }) => normalizeFuzzyTerm(word) === normalizeFuzzyTerm(form)
+    )
+    const correction =
+      folded ??
+      recovered.sort(
+        (a, b) =>
+          spellingDistance(a.word, a.form) - spellingDistance(b.word, b.form)
+      )[0]
+    const compound = entryPhraseGroups.find((forms) =>
+      forms.some((form) =>
+        tokenizeIndexLike(form).some((word) => term.startsWith(word))
+      )
+    )
+    const headingQuery = words.find((word) =>
+      getTermLookup().headingForms(word).includes(term)
+    )
+    const query =
+      literal ??
+      correction?.word ??
+      (compound ? tokenizeIndexLike(compound[0])[0] : undefined) ??
+      headingQuery ??
+      words[0] ??
+      term
+    const spelling =
+      literal ??
+      correction?.form ??
+      (compound
+        ? compound
+            .flatMap((form) => tokenizeIndexLike(form))
+            .find((word) => term.startsWith(word))
+        : undefined) ??
+      term
+    const match: SearchTermMatch = {
+      query,
+      term,
+      recovery: literal
+        ? 'literal'
+        : folded
+          ? 'folded'
+          : correction
+            ? 'typo'
+            : compound
+              ? 'compound'
+              : headingAlternatives.has(term)
+                ? 'heading'
+                : 'literal',
+      edits:
+        correction && !folded
+          ? spellingDistance(
+              normalizeFuzzyTerm(correction.word),
+              normalizeFuzzyTerm(correction.form)
+            )
+          : 0,
+      completeness:
+        term === spelling
+          ? 'word'
+          : term.startsWith(spelling)
+            ? 'prefix'
+            : 'substring'
+    }
+    termMatches.set(term, match)
+    return match
+  }
   const boostedResults = currentResults.map((r) => {
     const meta = metadata[r.id]
     const auxiliaryLabels = new Set(meta?.a)
@@ -929,6 +1025,8 @@ function runSearch(
 
     return {
       ...r,
+      rankingText: q,
+      termMatches: r.terms.map(describeTerm),
       entryMatch:
         entryPhraseGroups.length ||
         withHeadingContext ||
@@ -1026,6 +1124,361 @@ function runSearch(
       entryResults ? index.documentCount : MAX_RESULTS_IN_MEMORY
     )
   }
+}
+
+interface WordEvidence {
+  coverage: number
+  complete: number
+  partial: number
+  positions: number[]
+  span: number
+  ordered: boolean
+  count: number
+}
+
+function measureWords(text: string, variants: string[][]): WordEvidence {
+  const tokens = tokenizeIndexLike(text).map(normalizeFuzzyTerm)
+  let best: WordEvidence = {
+    coverage: 0,
+    complete: 0,
+    partial: 2,
+    positions: [],
+    span: Infinity,
+    ordered: false,
+    count: variants[0]?.length ?? 0
+  }
+  for (const words of variants) {
+    const groups = words.map((word) => {
+      for (const partial of [0, 1, 2]) {
+        const positions = tokens.flatMap((token, i) =>
+          (
+            partial === 0
+              ? token === word
+              : partial === 1
+                ? token.startsWith(word)
+                : token.includes(word)
+          )
+            ? [i]
+            : []
+        )
+        if (positions.length) return { positions, partial }
+      }
+      return { positions: [] as number[], partial: 2 }
+    })
+    const present = groups.filter((group) => group.positions.length)
+    let positions = present.map((group) => group.positions[0])
+    let span = positions.length
+      ? Math.max(...positions) - Math.min(...positions) + 1
+      : Infinity
+    for (const start of new Set(present.flatMap((group) => group.positions))) {
+      const candidate = present.map((group) =>
+        group.positions.find((i) => i >= start)
+      )
+      if (candidate.some((i) => i === undefined)) continue
+      const found = candidate as number[]
+      const width = Math.max(...found) - Math.min(...found) + 1
+      if (width < span) {
+        span = width
+        positions = found
+      }
+    }
+    const evidence = {
+      coverage: present.length,
+      complete: present.filter((group) => group.partial === 0).length,
+      partial: Math.max(0, ...present.map((group) => group.partial)),
+      positions,
+      span,
+      ordered: positions.every(
+        (position, i) => i === 0 || position > positions[i - 1]
+      ),
+      count: words.length
+    }
+    if (
+      evidence.coverage / Math.max(1, evidence.count) >
+        best.coverage / Math.max(1, best.count) ||
+      (evidence.coverage === evidence.count &&
+        (evidence.complete > best.complete ||
+          (evidence.complete === best.complete &&
+            (evidence.partial < best.partial ||
+              (evidence.partial === best.partial &&
+                evidence.span < best.span)))))
+    )
+      best = evidence
+  }
+  return best
+}
+
+export function describeEntryMatch(
+  entry: SearchEntryFields,
+  result: LocalSearchResult,
+  query: string,
+  wordForms: (word: string) => string[],
+  topic: boolean
+): SearchMatchEvidence {
+  const parsed = parseSearchQuery(query)
+  const normalize = (text: string) =>
+    normalizeFuzzyTerm(
+      text.replace(INVISIBLE_CHARS_RE, '').trim().toLowerCase()
+    )
+  let texts = [
+    ...new Set([result.rankingText ?? parsed.text, parsed.text].map(normalize))
+  ]
+  for (const forms of result.entryMatch?.groups ?? [])
+    texts = [
+      ...new Set(
+        texts.flatMap((text) =>
+          forms.map((form) =>
+            text.replaceAll(normalize(forms[0]), normalize(form))
+          )
+        )
+      )
+    ].slice(0, 16)
+  const variants = texts
+    .map((text) => tokenizeIndexLike(text).map(normalizeFuzzyTerm))
+    .filter((words) => words.length)
+  const primary = measureWords(entry.names.join(' '), variants)
+  const description = measureWords(entry.description, variants)
+  const body = measureWords(entry.body, variants)
+  const namedDescription = measureWords(
+    [entry.names.join(' '), entry.description].join(' '),
+    variants
+  )
+  const direct =
+    namedDescription.count > 0 &&
+    namedDescription.complete === namedDescription.count
+  const ownText = [entry.heading, entry.pageAlias].filter(Boolean).join(' ')
+  const ownForms = tokenizeIndexLike(entry.heading).flatMap(wordForms)
+  const parent = entry.parents.at(-1) ?? ''
+  const parentForms =
+    variants[0]?.length > 1 ? tokenizeIndexLike(parent).flatMap(wordForms) : []
+  const own = measureWords([ownText, ...ownForms].join(' '), variants)
+  const nearestText = [ownText, parent, ...ownForms, ...parentForms].join(' ')
+  const nearest = measureWords(nearestText, variants)
+  const hybrid = measureWords(
+    [nearestText, entry.names.join(' '), entry.description].join(' '),
+    variants
+  )
+  const inherited = measureWords(entry.parents.join(' '), variants)
+  const all = (evidence: WordEvidence) =>
+    evidence.count > 0 &&
+    evidence.coverage === evidence.count &&
+    evidence.partial < 2
+  const scopeWords = tokenizeIndexLike(entry.scope).map(normalizeFuzzyTerm)
+  const scopeFit = !entry.specialized
+    ? 0
+    : variants
+          .flat()
+          .some((word) => scopeWords.some((scope) => scope.startsWith(word)))
+      ? 1
+      : -1
+  const ownHit = all(own)
+  const ownContribution = own.coverage > 0
+  const specific =
+    ownHit ||
+    all(nearest) ||
+    ((ownContribution ||
+      (scopeFit === 1 &&
+        nearest.coverage > 0 &&
+        namedDescription.coverage > 0)) &&
+      all(hybrid))
+  const roleWords = variants
+    .flat()
+    .filter(
+      (word) =>
+        /(?:ers?|ors?)$/.test(word) ||
+        tokenizeIndexLike([entry.heading, parent].join(' ')).some(
+          (term) => term.endsWith('ing') && wordForms(term).includes(word)
+        )
+    )
+  const ownRole =
+    roleWords.length > 0 &&
+    roleWords.some((word) =>
+      [...tokenizeIndexLike(entry.heading), ...ownForms]
+        .map(normalizeFuzzyTerm)
+        .some((term) => term.startsWith(word))
+    )
+  const heading =
+    ownHit ||
+    (specific && (ownRole || (roleWords.length === 0 && ownContribution)))
+      ? 'own'
+      : specific
+        ? 'parent'
+        : inherited.coverage
+          ? 'ancestor'
+          : 'none'
+  const names = entry.names.map(normalize)
+  const statusName = normalize(entry.body.split(/\s[-–—]\s/)[0]).replace(
+    /\s*\([^)]*\)\s*$/,
+    ''
+  )
+  const fullName =
+    names.some((name) => texts.includes(name)) ||
+    (/^\/(?:unsafe|recently-removed)#/.test(entry.sectionId) &&
+      texts.includes(statusName))
+  const auxiliary =
+    !!result.entryMatch?.entries?.length &&
+    result.entryMatch.entries.every(
+      (match) => !match.heading && match.rank === 0
+    ) &&
+    !direct &&
+    !specific
+  const asksReference = variants
+    .flat()
+    .some((word) =>
+      /^(?:guides?|tutorials?|forums?|subreddit|wiki|documentation)$/.test(word)
+    )
+  const reference =
+    entry.reference ||
+    (!asksReference &&
+      /\b(?:guides?|tutorials?|forums?|subreddit|wiki|documentation)\b/i.test(
+        entry.description.split('/')[0]
+      ))
+  const curated =
+    entry.starred &&
+    !auxiliary &&
+    !reference &&
+    (direct ||
+      specific ||
+      primary.complete > 0 ||
+      (topic && (primary.coverage > 0 || own.coverage > 0)))
+  const phrase = texts.some((text) =>
+    [entry.description, ...entry.names].some((field) =>
+      createPhraseRegex(text).test(normalize(field))
+    )
+  )
+  const exactName = fullName && !reference && (!topic || curated)
+  const kind = auxiliary
+    ? 'auxiliary'
+    : exactName
+      ? 'name'
+      : direct && phrase
+        ? 'phrase'
+        : direct
+          ? 'words'
+          : specific
+            ? 'heading'
+            : all(body)
+              ? 'words'
+              : heading === 'ancestor'
+                ? 'ancestor'
+                : auxiliary
+                  ? 'auxiliary'
+                  : 'substring'
+  let strength = auxiliary
+    ? 0
+    : exactName
+      ? 7
+      : curated && (direct || specific)
+        ? 6
+        : direct && phrase
+          ? 5
+          : direct
+            ? 4
+            : specific
+              ? 3
+              : all(body)
+                ? 2
+                : heading === 'ancestor'
+                  ? 1
+                  : 0
+  if (topic && specific && !reference)
+    strength = Math.max(strength, curated ? 6 : 4)
+  if (reference && strength > 3) strength--
+  const termEvidence = result.termMatches ?? []
+  const strongest = new Map<string, SearchTermMatch>()
+  for (const match of termEvidence) {
+    const previous = strongest.get(match.query)
+    if (
+      !previous ||
+      RECOVERY_ORDER[match.recovery] < RECOVERY_ORDER[previous.recovery] ||
+      (RECOVERY_ORDER[match.recovery] === RECOVERY_ORDER[previous.recovery] &&
+        match.edits < previous.edits)
+    )
+      strongest.set(match.query, match)
+  }
+  let recovery: SearchMatchEvidence['recovery'] = [
+    ...strongest.values()
+  ].reduce<SearchMatchEvidence['recovery']>(
+    (kind, match) =>
+      RECOVERY_ORDER[match.recovery] > RECOVERY_ORDER[kind]
+        ? match.recovery
+        : kind,
+    'literal'
+  )
+  if (
+    !direct &&
+    specific &&
+    !all(measureWords([ownText, parent].join(' '), variants)) &&
+    recovery === 'literal'
+  )
+    recovery = 'heading'
+  const measured =
+    direct && all(primary)
+      ? primary
+      : direct && all(description)
+        ? description
+        : body
+  return {
+    confidence: strength >= 3 ? 1 : 0,
+    scopeFit,
+    specificity: heading === 'own' ? 2 : heading === 'parent' ? 1 : 0,
+    resourceName:
+      names.find((name) => all(measureWords(name, variants))) ?? statusName,
+    hasDescription: entry.description.trim().length > 0,
+    depth: entry.parents.length,
+    kind,
+    name: all(primary),
+    description: all(description),
+    heading,
+    recovery,
+    edits: [...strongest.values()].reduce((sum, match) => sum + match.edits, 0),
+    positions: measured.positions,
+    span: measured.coverage === measured.count ? measured.span : Infinity,
+    ordered: measured.ordered,
+    completeWords: measured.complete,
+    partial: measured.partial,
+    curated,
+    reference,
+    warning:
+      entry.sectionId.startsWith('/unsafe#') && texts.includes(statusName),
+    removed: /^\/recently-removed(?:\.html)?#/.test(entry.sectionId),
+    strength,
+    // A complete phrase has the same textual relevance in a short or long description.
+    score: direct && phrase ? 1 : result.score,
+    order: entry.order,
+    id: entry.id
+  }
+}
+
+export function compareEntryMatches(
+  a: SearchMatchEvidence,
+  b: SearchMatchEvidence
+) {
+  return (
+    Number(b.warning) - Number(a.warning) ||
+    Number(b.strength === 7) - Number(a.strength === 7) ||
+    b.confidence - a.confidence ||
+    Number(a.removed) - Number(b.removed) ||
+    Number(b.strength === 7 && b.curated) -
+      Number(a.strength === 7 && a.curated) ||
+    Number(b.name && b.curated && b.completeWords > 0) -
+      Number(a.name && a.curated && a.completeWords > 0) ||
+    b.scopeFit - a.scopeFit ||
+    b.strength - a.strength ||
+    Number(b.name) - Number(a.name) ||
+    (b.curated ? b.specificity : 0) - (a.curated ? a.specificity : 0) ||
+    RECOVERY_ORDER[a.recovery] - RECOVERY_ORDER[b.recovery] ||
+    a.edits - b.edits ||
+    b.completeWords - a.completeWords ||
+    (a.span === b.span ? 0 : a.span - b.span) ||
+    Number(b.ordered) - Number(a.ordered) ||
+    Number(b.curated) - Number(a.curated) ||
+    (a.name ? a.depth : 0) - (b.name ? b.depth : 0) ||
+    Number(b.name && b.hasDescription) - Number(a.name && a.hasDescription) ||
+    b.score - a.score ||
+    a.order - b.order ||
+    a.id.localeCompare(b.id)
+  )
 }
 
 function spellingDistance(a: string, b: string): number {

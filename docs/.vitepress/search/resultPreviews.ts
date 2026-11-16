@@ -4,6 +4,7 @@ import type {
   LocalSearchResult,
   Result,
   SearchEntryMatch,
+  SearchMatchEvidence,
   SearchMetadata,
   SidebarItem
 } from './types'
@@ -13,7 +14,7 @@ import { pathToFile } from 'vitepress/dist/client/app/utils'
 import { createApp, h } from 'vue'
 import CriticalBadge from '../theme/components/CriticalBadge.vue'
 import Tooltip from '../theme/components/Tooltip.vue'
-import { SEARCH_ENTRY_SELECTOR } from './matchHighlighting'
+import { getSearchEntryText, SEARCH_ENTRY_SELECTOR } from './matchHighlighting'
 import {
   createPhraseRegex,
   normalizeSearchText as normalizeExcerptText,
@@ -26,7 +27,9 @@ import {
   tokenizeSearchText
 } from './normalization'
 import {
+  compareEntryMatches,
   createSearchEngine,
+  describeEntryMatch,
   MAX_RESULTS_IN_MEMORY,
   mergeSearchMatches
 } from './searchEngine'
@@ -690,6 +693,281 @@ function filterQueryResults(
   }
 }
 
+// Project qualified matches onto rendered page blocks without changing section eligibility.
+export function prepareSearchPreviews(
+  results: LocalSearchResult[],
+  query: string,
+  fuzzy: boolean
+): LocalSearchResult[] {
+  const template = document.createElement('template')
+  return results.map((result) => {
+    template.innerHTML = result.text ?? ''
+    const elements = [
+      ...template.content.querySelectorAll(SEARCH_ENTRY_SELECTOR)
+    ].filter(
+      (element) =>
+        !element.closest('.critical-badge-hidden-body, .tooltip-body') &&
+        (element.tagName === 'LI' ||
+          !element.parentElement?.closest(SEARCH_ENTRY_SELECTOR))
+    )
+    const branches = result.searchBranches ?? [query]
+    const selected: {
+      original: Element
+      element: Element
+      match: SearchEntryMatch
+      order: number
+    }[] = []
+    const seen = new Set<string>()
+    const usedIds = new Set<string>()
+    for (const [ordinal, element] of elements.entries()) {
+      const own = element.cloneNode(true) as Element
+      own.querySelectorAll('ul,ol').forEach((list) => list.remove())
+      stripSearchNoteLinks(own)
+      const context = getSearchEntryText(own)
+      const visible = own.cloneNode(true) as Element
+      visible
+        .querySelectorAll(
+          '.critical-badge-hidden-body, .tooltip-body, criticalbadge, tooltip'
+        )
+        .forEach((note) => note.remove())
+      const normalized = normalizeExcerptText(getSearchEntryText(visible))
+      let matched: SearchEntryMatch | undefined
+      let matchOrder = Number.MAX_SAFE_INTEGER
+      for (const [branchOrdinal, branch] of branches.entries()) {
+        const branchResult = result.branchMatches?.[branch] ?? result
+        const parsed = parseSearchQuery(branch)
+        const known = branchResult.entryMatch?.entries?.find(
+          (entry) =>
+            !entry.heading &&
+            (!entry.id || !usedIds.has(entry.id)) &&
+            normalizeExcerptText(entry.context) === normalized
+        )
+        const urlQuery =
+          branchResult.urlMatched && !parsed.phrases.length
+            ? buildUrlQuery(parsed.text)
+            : null
+        const urlMatched =
+          !!urlQuery &&
+          [...own.querySelectorAll('a[href]')].some((link) =>
+            urlMatchesNormalizedUrl(
+              normalizeUrlSearchValue(link.getAttribute('href') ?? ''),
+              urlQuery
+            )
+          )
+        const literal =
+          !!parsed.text &&
+          normalized.includes(normalizeExcerptText(parsed.text))
+        const hasFilters =
+          parsed.sites.length ||
+          parsed.titles.length ||
+          parsed.urls.length ||
+          parsed.excludedTerms.length ||
+          parsed.excludedSites.length
+        let verified: LocalSearchResult | undefined
+        if (!known || hasFilters) {
+          verified = filterResults(
+            [
+              {
+                ...branchResult,
+                id: result.id,
+                text: visible.outerHTML,
+                title: '',
+                titles: [],
+                searchBranches: undefined,
+                branchMatches: undefined,
+                urlMatched,
+                substringMatched: !!branchResult.substringMatched && literal,
+                entryMatch: branchResult.entryMatch
+                  ? {
+                      ...branchResult.entryMatch,
+                      entries: undefined,
+                      headings:
+                        fuzzy && !parsed.phrases.length
+                          ? branchResult.entryMatch.headings
+                          : []
+                    }
+                  : undefined
+              }
+            ],
+            branch,
+            false,
+            fuzzy
+          )[0]
+          if (!verified) continue
+        }
+        const ownEvidence = verified?.entryMatch?.entries?.find(
+          (entry) =>
+            !entry.heading && normalizeExcerptText(entry.context) === normalized
+        )
+        const filtersOnly = !parsed.text && !parsed.phrases.length && hasFilters
+        const present = new Set(
+          tokenizeIndexLike(
+            [getSearchEntryText(visible), collectIconLabels(visible)].join(' '),
+            true
+          )
+        )
+        const ownTerms =
+          fuzzy &&
+          !parsed.phrases.length &&
+          (branchResult.matchesWithoutTerms
+            ? branchResult.matchesWithoutTerms(
+                new Set(
+                  branchResult.terms.filter((term) => !present.has(term))
+                ),
+                false
+              )
+            : tokenizeIndexLike(parsed.text).every((word) => {
+                const alternatives =
+                  branchResult.termMatches?.filter(
+                    (match) => match.query === word
+                  ) ?? []
+                return (
+                  alternatives.some(
+                    (match) =>
+                      match.recovery !== 'compound' && present.has(match.term)
+                  ) ||
+                  (alternatives.some(
+                    (match) => match.recovery === 'compound'
+                  ) &&
+                    alternatives
+                      .filter((match) => match.recovery === 'compound')
+                      .every((match) => present.has(match.term)))
+                )
+              }))
+        if (
+          !known &&
+          !ownEvidence &&
+          !literal &&
+          !(parsed.phrases.length && verified) &&
+          !urlMatched &&
+          !filtersOnly &&
+          !ownTerms
+        )
+          continue
+        const phrases =
+          ownEvidence?.phrases ??
+          known?.phrases ??
+          (fuzzy && !parsed.phrases.length
+            ? branchResult.terms.filter((term) => present.has(term))
+            : [
+                ...parsed.phrases,
+                parsed.phrases.length ? parsed.unquotedText : parsed.text
+              ].filter(Boolean))
+        const rank =
+          ownEvidence?.rank ??
+          known?.rank ??
+          (own.classList.contains('starred') ? 2 : 1)
+        const record: SearchEntryMatch = {
+          ...known,
+          ...ownEvidence,
+          context,
+          phrases,
+          rank,
+          heading: false,
+          id: known?.id ?? `${result.id}~preview-${ordinal}`
+        }
+        if (!matched) matched = record
+        else
+          matched = {
+            ...matched,
+            phrases: [...new Set([...matched.phrases, ...phrases])],
+            rank: Math.max(matched.rank, rank)
+          }
+        const knownOrder =
+          branchResult.entryMatch?.entries?.indexOf(known!) ?? -1
+        matchOrder = Math.min(
+          matchOrder,
+          branchOrdinal * 100000 + (knownOrder >= 0 ? knownOrder : ordinal)
+        )
+      }
+      if (!matched) continue
+      const key = normalized + '\0' + own.outerHTML
+      if (seen.has(key)) continue
+      seen.add(key)
+      usedIds.add(matched.id!)
+      own.setAttribute('data-search-entry', matched.id!)
+      selected.push({
+        original: element,
+        element: own,
+        match: matched,
+        order: matchOrder
+      })
+    }
+    // Retrieval already orders matching entries, including the broad-topic policy.
+    selected.sort((a, b) => a.order - b.order || b.match.rank - a.match.rank)
+    const output = document.createElement('div')
+    let sourceParent: Element | null = null
+    let wrapper: Element | undefined
+    for (const { original, element } of selected) {
+      const parent = original.parentElement
+      if (element.tagName === 'LI' || element.tagName === 'TR') {
+        if (parent !== sourceParent || !wrapper) {
+          sourceParent = parent
+          wrapper = parent?.cloneNode(false) as Element | undefined
+          wrapper ??= document.createElement(
+            element.tagName === 'LI' ? 'ul' : 'tbody'
+          )
+          wrapper.removeAttribute('id')
+          if (element.tagName === 'TR') {
+            const table = original.closest('table')?.cloneNode(false) as
+              Element | undefined
+            const container = table ?? document.createElement('table')
+            container.removeAttribute('id')
+            container.append(wrapper)
+            output.append(container)
+          } else output.append(wrapper)
+        }
+        if (element.tagName === 'LI' && parent?.tagName === 'OL') {
+          const list = parent as HTMLOListElement
+          let value = list.hasAttribute('start')
+            ? list.start
+            : list.reversed
+              ? list.children.length
+              : 1
+          for (const sibling of list.children) {
+            if (sibling.hasAttribute('value'))
+              value = (sibling as HTMLLIElement).value
+            if (sibling === original) break
+            value += list.reversed ? -1 : 1
+          }
+          ;(element as HTMLLIElement).value = value
+        }
+        wrapper.append(element)
+      } else {
+        sourceParent = null
+        wrapper = undefined
+        output.append(element)
+      }
+    }
+    const first = selected[0]?.match
+    return {
+      ...result,
+      text: output.innerHTML,
+      headingSupported: first
+        ? first.evidence?.kind === 'heading' ||
+          first.evidence?.kind === 'ancestor'
+        : !!result.entryMatch?.entries?.some((entry) => entry.heading) ||
+          branches.some((branch) => {
+            const text = normalizeExcerptText(parseSearchQuery(branch).text)
+            return (
+              !!text &&
+              [result.title, ...result.titles].some((heading) =>
+                createPhraseRegex(text).test(normalizeExcerptText(heading))
+              )
+            )
+          }),
+      entryMatch: {
+        groups: result.entryMatch?.groups ?? [],
+        auxiliary: result.entryMatch?.auxiliary ?? [],
+        ...result.entryMatch,
+        entries: selected.length
+          ? selected.map((row) => row.match)
+          : (result.entryMatch?.entries?.filter((entry) => entry.heading) ?? [])
+      }
+    }
+  })
+}
+
 interface ResourceEntry {
   id: string
   section: LocalSearchResult
@@ -872,13 +1150,20 @@ export function createEntrySearch(
           ? urls.filter((link) => link.primary).map((link) => link.url)
           : []
       }
-      let description = body.slice(descriptionStart)
-      for (const link of [...links].reverse())
-        if (!link.primary && link.start >= descriptionStart)
-          description =
-            description.slice(0, link.start - descriptionStart) +
-            ' '.repeat(link.end - link.start) +
-            description.slice(link.end - descriptionStart)
+      const descriptive = body.split('')
+      for (const link of links)
+        if (!link.primary) descriptive.fill(' ', link.start, link.end)
+      for (const note of own.querySelectorAll(
+        'criticalbadge, .critical-badge-hidden-body, .tooltip-source-link'
+      )) {
+        const range = document.createRange()
+        range.selectNodeContents(own)
+        range.setEndBefore(note)
+        const start = range.toString().length
+        range.setEndAfter(note)
+        descriptive.fill(' ', start, range.toString().length)
+      }
+      const description = descriptive.join('').slice(descriptionStart)
       entries.push({
         id,
         section,
@@ -941,287 +1226,294 @@ export function createEntrySearch(
     }))
   )
   const engine = createSearchEngine(index, entryMetadata, sidebar, true)
-  return {
-    search(query: string, options: { fuzzy: boolean; urls: boolean }) {
-      const parsed = parseSearchQuery(query)
-      const words = tokenizeIndexLike(parsed.text)
-      const candidates = engine.search(query, options).results.map((result) => {
+  const topicForms = (word: string) => {
+    const forms = [normalize(word)]
+    if (word.endsWith('s') && !word.endsWith('ss'))
+      forms.push(normalize(word.slice(0, -1)))
+    if (word.endsWith('ing') && word.length > 5)
+      forms.push(
+        normalize(word.slice(0, -3)),
+        normalize(word.slice(0, -3) + 'e')
+      )
+    return forms
+  }
+  const headingTopics = new Map<string, Map<string, Set<string>>>()
+  for (const section of sections) {
+    if (/^\/(?:recently-removed|unsafe)(?:#|$)/.test(section.id)) continue
+    const page = section.id.split('#')[0]
+    for (const word of tokenizeIndexLike(section.title))
+      for (const form of topicForms(word)) {
+        const pages = headingTopics.get(form) ?? new Map<string, Set<string>>()
+        const ids = pages.get(page) ?? new Set<string>()
+        ids.add(section.id)
+        pages.set(page, ids)
+        headingTopics.set(form, pages)
+      }
+  }
+  const search = (
+    query: string,
+    options: { fuzzy: boolean; urls: boolean }
+  ) => {
+    const parsed = parseSearchQuery(query)
+    const words = tokenizeIndexLike(parsed.text)
+    const candidates = engine.search(query, options).results.map((result) => {
+      const entry = byId.get(result.id)!
+      return {
+        ...result,
+        text: entry.html,
+        entryMatch: result.entryMatch
+          ? {
+              ...result.entryMatch,
+              // A broad ancestor's word forms alone must not classify every descendant.
+              headings:
+                words.length === 1
+                  ? [
+                      entry.section.title,
+                      ...(entry.section.indexedTitles ?? []),
+                      ...tokenizeIndexLike(entry.section.title).flatMap(
+                        wordForms
+                      ),
+                      pageAlias(entry.section)
+                    ]
+                  : [...(result.entryMatch.headings ?? []), ...entry.aliases]
+            }
+          : undefined
+      }
+    })
+    let matches = filterResults(candidates, query, true, true)
+    const normalizedQuery = normalize(parsed.text)
+    const single = words.length === 1
+    const wholeName = matches.some((result) =>
+      entryMetadata[result.id].s?.some(
+        (name) => normalize(name) === normalizedQuery
+      )
+    )
+    const canonicalForms =
+      single && /^[a-z]{2,4}$/i.test(words[0]) && !wholeName
+        ? [
+            ...new Set(
+              matches.flatMap((result) =>
+                (entryMetadata[result.id].s ?? [])
+                  .flatMap((name) => tokenizeIndexLike(name, true))
+                  .filter((word) => normalize(word) === normalizedQuery)
+              )
+            )
+          ]
+        : []
+    if (canonicalForms.length)
+      matches = matches.filter((result) => {
         const entry = byId.get(result.id)!
-        return {
-          ...result,
-          text: entry.html,
-          entryMatch: result.entryMatch
-            ? {
-                ...result.entryMatch,
-                // A broad ancestor's word forms alone must not classify every descendant.
-                headings:
-                  words.length === 1
-                    ? [
-                        entry.section.title,
-                        ...(entry.section.indexedTitles ?? []),
-                        ...tokenizeIndexLike(entry.section.title).flatMap(
-                          wordForms
-                        ),
-                        pageAlias(entry.section)
-                      ]
-                    : [...(result.entryMatch.headings ?? []), ...entry.aliases]
-              }
-            : undefined
-        }
+        return (
+          result.urlMatchRank === 3 ||
+          pageAlias(entry.section) === normalizedQuery ||
+          canonicalForms.some((form) =>
+            [
+              entry.body,
+              entry.section.title,
+              ...(entry.section.indexedTitles ?? [])
+            ].some((text) => createPhraseRegex(form).test(text))
+          )
+        )
       })
-      let matches = filterResults(candidates, query, true, true)
-      const normalizedQuery = normalize(parsed.text)
-      const single = words.length === 1
-      const wholeName = matches.some((result) =>
-        entryMetadata[result.id].s?.some(
-          (name) => normalize(name) === normalizedQuery
+    const canonicalWord =
+      tokenizeIndexLike(
+        matches.find((result) => result.rankingText)?.rankingText ?? parsed.text
+      )[0] ?? ''
+    const topicStrength = (section: LocalSearchResult) => {
+      if (!single) return 0
+      const page = section.id.split('#')[0]
+      const slug = page.split('/').at(-1)!
+      const queryForms = topicForms(canonicalWord)
+      if (
+        pageAlias(section) === canonicalWord ||
+        (!slug.includes('-') &&
+          topicForms(slug).some((form) => queryForms.includes(form)))
+      )
+        return 1002
+      const facets = (section.pageTitle ?? '')
+        .replace(/<[^>]*>/g, ' ')
+        .split('/')
+      const matchesFacet = (facet: string) =>
+        tokenizeIndexLike(facet).some((word) =>
+          [...topicForms(word), ...wordForms(word).map(normalize)].some(
+            (form) => queryForms.includes(form)
+          )
+        )
+      if (matchesFacet(facets[0])) return 1001
+      const headings = Math.max(
+        0,
+        ...queryForms.map(
+          (form) => headingTopics.get(form)?.get(page)?.size ?? 0
         )
       )
-      const canonicalForms =
-        single && /^[a-z]{2,4}$/i.test(words[0]) && !wholeName
-          ? [
-              ...new Set(
-                matches.flatMap((result) =>
-                  (entryMetadata[result.id].s ?? [])
-                    .flatMap((name) => tokenizeIndexLike(name, true))
-                    .filter((word) => normalize(word) === normalizedQuery)
-                )
-              )
-            ]
-          : []
-      if (canonicalForms.length)
-        matches = matches.filter((result) => {
-          const entry = byId.get(result.id)!
+      return (facets.slice(1).some(matchesFacet) ? 100 : 0) + headings
+    }
+    const topic =
+      single &&
+      (matches.some(
+        (result) => topicStrength(byId.get(result.id)!.section) >= 1000
+      ) ||
+        [...headingTopics].some(
+          ([form, pages]) =>
+            topicForms(canonicalWord).includes(form) &&
+            [...pages.values()].reduce((sum, ids) => sum + ids.size, 0) >= 2
+        ))
+    const quality = new Map<string, SearchMatchEvidence>()
+    for (const result of matches) {
+      const entry = byId.get(result.id)!
+      const page = entry.section.id
+        .split('#')[0]
+        .replace(/\.html$/, '')
+        .split('/')
+        .at(-1)
+      const specialized =
+        page === 'mobile' || page === 'linux-macos' || page === 'non-english'
+      const scope =
+        page === 'non-english'
+          ? (entry.section.indexedTitles?.[0] ?? entry.section.title)
+          : (entry.section.pageTitle ?? entry.section.indexedTitles?.[0] ?? '')
+      const evidence = describeEntryMatch(
+        {
+          id: entry.id,
+          sectionId: entry.section.id,
+          names: entry.names,
+          body: entry.body,
+          description: entry.description,
+          heading: entry.section.title,
+          pageAlias: pageAlias(entry.section),
+          parents: entry.section.indexedTitles ?? [],
+          specialized,
+          scope,
+          starred: entry.starred,
+          reference: entry.reference,
+          order: entry.order
+        },
+        result,
+        query,
+        wordForms,
+        topic
+      )
+      quality.set(result.id, evidence)
+      if (result.entryMatch)
+        result.entryMatch = {
+          ...result.entryMatch,
+          entries: result.entryMatch.entries?.map((match) => ({
+            ...match,
+            id: entry.id,
+            evidence
+          }))
+        }
+    }
+    const namedLookup =
+      single &&
+      /^[a-z]{5,}$/i.test(words[0]) &&
+      matches.some((result) => quality.get(result.id)!.strength === 7)
+    if (namedLookup)
+      matches = matches.filter((result) => {
+        const evidence = quality.get(result.id)!
+        return (
+          evidence.kind !== 'substring' ||
+          evidence.partial < 2 ||
+          evidence.completeWords > 0 ||
+          result.urlMatchRank === 3
+        )
+      })
+    matches.sort((a, b) =>
+      compareEntryMatches(quality.get(a.id)!, quality.get(b.id)!)
+    )
+    const grouped = new Map<string, LocalSearchResult>()
+    for (const match of matches) {
+      const entry = byId.get(match.id)!
+      const previous = grouped.get(entry.section.id)
+      if (previous) {
+        const merged = mergeSearchMatches(previous, match)
+        grouped.set(entry.section.id, {
+          ...merged,
+          id: entry.section.id,
+          entryMatch: previous.entryMatch
+            ? {
+                ...previous.entryMatch,
+                entries: [
+                  ...(previous.entryMatch.entries ?? []),
+                  ...(match.entryMatch?.entries ?? [])
+                ]
+              }
+            : match.entryMatch
+        })
+      } else
+        grouped.set(entry.section.id, {
+          ...entry.section,
+          ...match,
+          id: entry.section.id,
+          title: entry.section.title,
+          titles: entry.section.titles,
+          indexedTitles: entry.section.indexedTitles,
+          pageTitle: entry.section.pageTitle,
+          sectionOrder: entry.section.sectionOrder,
+          text: entry.section.text
+        })
+    }
+    const results = [...grouped.values()]
+    if (topic) {
+      for (const result of results)
+        result.entryMatch?.entries?.sort((a, b) => {
+          const x = a.evidence!,
+            y = b.evidence!
           return (
-            result.urlMatchRank === 3 ||
-            pageAlias(entry.section) === normalizedQuery ||
-            canonicalForms.some((form) =>
-              [
-                entry.body,
-                entry.section.title,
-                ...(entry.section.indexedTitles ?? [])
-              ].some((text) => createPhraseRegex(form).test(text))
-            )
+            Number(y.warning) - Number(x.warning) ||
+            Number(y.strength === 7 && y.curated) -
+              Number(x.strength === 7 && x.curated) ||
+            Number(x.removed) - Number(y.removed) ||
+            Number(x.reference) - Number(y.reference) ||
+            Number(y.curated) - Number(x.curated) ||
+            x.order - y.order
           )
         })
-      const lookup =
-        single &&
-        matches.some(
-          (result) =>
-            !byId.get(result.id)!.reference &&
-            entryMetadata[result.id].s?.some(
-              (name) =>
-                normalize(name) === normalizedQuery ||
-                (words[0].length <= 4 &&
-                  tokenizeIndexLike(name, true).some(
-                    (word) => normalize(word) === normalizedQuery
-                  ))
-            )
+      const pageOrder = new Map<string, number>()
+      for (const section of sections) {
+        const page = section.id.split('#')[0]
+        pageOrder.set(
+          page,
+          Math.min(pageOrder.get(page) ?? Infinity, section.sectionOrder ?? 0)
         )
-      const topicForms = (word: string) => {
-        const forms = [normalize(word)]
-        if (word.endsWith('s') && !word.endsWith('ss'))
-          forms.push(normalize(word.slice(0, -1)))
-        if (word.endsWith('ing') && word.length > 5)
-          forms.push(
-            normalize(word.slice(0, -3)),
-            normalize(word.slice(0, -3) + 'e')
-          )
-        return forms
       }
-      const topicStrength = (section: LocalSearchResult) => {
-        if (!single) return 0
-        const page = section.id.split('#')[0].split('/').at(-1)!
-        const subject = tokenizeIndexLike(
-          (section.pageTitle ?? '').replace(/<[^>]*>/g, '').split('/')[0]
-        )[0]
-        const forms = topicForms(words[0])
-        if (
-          pageAlias(section) === words[0] ||
-          (!page.includes('-') &&
-            topicForms(page).some((form) => forms.includes(form)))
-        )
-          return 2
-        return subject &&
-          topicForms(subject).some((form) => forms.includes(form))
-          ? 1
-          : 0
-      }
-      const topic = matches.some(
-        (result) => topicStrength(byId.get(result.id)!.section) > 0
-      )
-      const headingCoverage = (entry: ResourceEntry) => {
-        const own = tokenizeIndexLike(entry.section.title)
-        const context = [
-          ...own,
-          ...tokenizeIndexLike((entry.section.indexedTitles ?? []).join(' ')),
-          ...entry.aliases
-        ]
-        const covered =
-          words.length > 1 &&
-          words.every((word) => context.some((term) => term.startsWith(word)))
-        const roles = words.filter((word) => /(?:ors?|ers?)$/.test(word))
-        const ownRole = roles.some((word) =>
-          [...own, ...own.flatMap(wordForms)].some((term) =>
-            term.startsWith(word)
-          )
-        )
-        return {
-          role: covered && roles.length > 0,
-          rank: covered ? (ownRole ? 2 : 1) : 0
-        }
-      }
-      const task = matches.some(
-        (result) => headingCoverage(byId.get(result.id)!).role
-      )
-      const quality = new Map<string, number[]>()
-      for (const result of matches) {
-        const entry = byId.get(result.id)!
-        const names = entry.names.map(normalize)
-        const forms = [
-          normalizedQuery,
-          ...(result.entryMatch?.groups ?? []).flat().map(normalize)
-        ]
-        const statusName = /^\/(?:unsafe|recently-removed)#/.test(
-          entry.section.id
-        )
-          ? normalize(entry.body.split(/\s[-–—]\s/)[0])
-          : ''
-        const exact =
-          names.some((name) => forms.includes(name)) ||
-          !!(statusName && forms.includes(statusName))
-        const nameMatch = names.some((name) =>
-          forms.some((form) => createPhraseRegex(form).test(name))
-        )
-          ? 2
-          : names.some((name) => name.startsWith(normalizedQuery))
-            ? 1
-            : 0
-        const evidence = result.entryMatch?.entries ?? []
-        const auxiliary =
-          evidence.length > 0 &&
-          evidence.every((match) => !match.heading && match.rank === 0)
-        const curated = entry.starred && !auxiliary
-        const reference = entry.reference
-        const active = !/^\/recently-removed(?:\.html)?#/.test(entry.section.id)
-        const headingRank = headingCoverage(entry).rank
-        const direct =
-          result.terms.some((term) => forms.includes(normalize(term))) &&
-          !auxiliary
-        const unsafe =
-          entry.section.id.startsWith('/unsafe#') &&
-          statusName === normalizedQuery
-        const referenceMaterial =
-          !words.some((word) =>
-            /^(?:guides?|tutorials?|forums?|subreddit|wiki|documentation)$/.test(
-              word
-            )
-          ) &&
-          /\b(?:guides?|tutorials?|forums?|subreddit|wiki|documentation)\b/i.test(
-            entry.description.split('/')[0]
-          )
-        let rank = single
-          ? [
-              unsafe,
-              direct,
-              exact && !reference,
-              active,
-              !reference,
-              nameMatch,
-              curated
-            ]
-          : [
-              unsafe,
-              exact && !reference,
-              active,
-              !reference,
-              headingRank,
-              curated,
-              nameMatch
-            ]
-        if (task)
-          rank = [
-            unsafe,
-            active,
-            !reference,
-            !referenceMaterial,
-            headingRank,
-            curated,
-            exact && !reference,
-            nameMatch
-          ]
-        if (topic || (single && !lookup))
-          rank = [unsafe, active, !reference, curated]
-        quality.set(result.id, rank.map(Number))
-      }
-      // Section ranks break entry-score ties; they never restrict retrieval.
-      const sectionOrder = new Map(
-        sectionEngine
-          .search(query, options)
-          .results.map((section, ordinal) => [section.id, ordinal])
-      )
-      const orderOf = (id: string) => sectionOrder.get(id) ?? sections.length
-
-      matches.sort((a, b) => {
-        const left = quality.get(a.id)!,
-          right = quality.get(b.id)!
-        for (let i = 0; i < left.length; i++)
-          if (left[i] !== right[i]) return right[i] - left[i]
-        const x = byId.get(a.id)!,
-          y = byId.get(b.id)!
+      results.sort((a, b) => {
+        const x = a.entryMatch?.entries?.[0]?.evidence,
+          y = b.entryMatch?.entries?.[0]?.evidence
+        const strengthA = topicStrength(a),
+          strengthB = topicStrength(b)
         return (
-          orderOf(x.section.id) - orderOf(y.section.id) || x.order - y.order
+          Number(!!y && (y.warning || (y.strength === 7 && y.curated))) -
+            Number(!!x && (x.warning || (x.strength === 7 && x.curated))) ||
+          (y?.scopeFit ?? 0) - (x?.scopeFit ?? 0) ||
+          strengthB - strengthA ||
+          Number(strengthB < 1000 && y?.heading === 'own') -
+            Number(strengthA < 1000 && x?.heading === 'own') ||
+          Number(!a.entryMatch?.entries?.some((entry) => !entry.heading)) -
+            Number(!b.entryMatch?.entries?.some((entry) => !entry.heading)) ||
+          (pageOrder.get(a.id.split('#')[0]) ?? 0) -
+            (pageOrder.get(b.id.split('#')[0]) ?? 0) ||
+          (a.sectionOrder ?? 0) - (b.sectionOrder ?? 0) ||
+          (x && y ? compareEntryMatches(x, y) : a.id.localeCompare(b.id))
         )
       })
-      const grouped = new Map<string, LocalSearchResult>()
-      for (const match of matches) {
-        const entry = byId.get(match.id)!
-        const previous = grouped.get(entry.section.id)
-        if (previous) {
-          const merged = mergeSearchMatches(previous, match)
-          grouped.set(entry.section.id, {
-            ...merged,
-            id: entry.section.id,
-            entryMatch: previous.entryMatch
-              ? {
-                  ...previous.entryMatch,
-                  entries: [
-                    ...(previous.entryMatch.entries ?? []),
-                    ...(match.entryMatch?.entries ?? [])
-                  ]
-                }
-              : match.entryMatch
-          })
-        } else
-          grouped.set(entry.section.id, {
-            ...entry.section,
-            ...match,
-            id: entry.section.id,
-            title: entry.section.title,
-            titles: entry.section.titles,
-            indexedTitles: entry.section.indexedTitles,
-            pageTitle: entry.section.pageTitle,
-            sectionOrder: entry.section.sectionOrder,
-            text: entry.section.text
-          })
-      }
-      const results = [...grouped.values()]
-      if (topic)
-        results.sort(
-          (a, b) =>
-            topicStrength(b) - topicStrength(a) ||
-            (topicStrength(a) > 0
-              ? Number(
-                  !a.entryMatch?.entries?.some((entry) => !entry.heading)
-                ) -
-                  Number(
-                    !b.entryMatch?.entries?.some((entry) => !entry.heading)
-                  ) || (a.sectionOrder ?? 0) - (b.sectionOrder ?? 0)
-              : orderOf(a.id) - orderOf(b.id))
+    }
+    for (const result of results) {
+      const first = result.entryMatch?.entries?.[0]?.evidence
+      result.headingSupported =
+        first?.kind === 'heading' || first?.kind === 'ancestor'
+    }
+    return { results: results.slice(0, MAX_RESULTS_IN_MEMORY) }
+  }
+  return {
+    search,
+    suggest(query: string) {
+      return engine
+        .suggest(query)
+        .filter(
+          (suggestion) =>
+            search(suggestion, { fuzzy: true, urls: false }).results.length > 0
         )
-      else if (single && !lookup)
-        results.sort((a, b) => orderOf(a.id) - orderOf(b.id))
-      return { results: results.slice(0, MAX_RESULTS_IN_MEMORY) }
     }
   }
 }

@@ -46,6 +46,7 @@ import {
   filterSearchExclusions,
   loadExcerpts,
   lookupExcerptText,
+  prepareSearchPreviews,
   usesEntrySearch
 } from './resultPreviews'
 import { createSearchEngine, loadSearchIndex } from './searchEngine'
@@ -358,7 +359,7 @@ export function useSearchModal() {
     if (!filterText.value || results.value.length > 0 || !activeSnapshot.value)
       return []
 
-    return activeSnapshot.value?.engine.suggest(filterText.value) ?? []
+    return activeSnapshot.value.entryEngine.suggest(filterText.value)
   })
 
   watch([filterText, isFuzzySearch, isUrlSearch], () => {
@@ -606,6 +607,8 @@ export function useSearchModal() {
             finalResults = filterSearchExclusions(finalResults, query)
         }
       }
+      if (showDetailedListValue)
+        finalResults = prepareSearchPreviews(finalResults, query, fuzzy)
       const totalCount =
         useEntrySearch || needsContentFiltering
           ? scopedMatches.length
@@ -691,10 +694,19 @@ export function useSearchModal() {
           r,
           item?.querySelector('.excerpt')
         )
-        if (marks.length > 0 || preferred) {
-          const groups = groupMarks(marks)
-          // A heading-supported resource may have no literal query word to mark.
-          if (preferred && !marks.includes(preferred))
+        const owners = [
+          ...(item?.querySelectorAll<HTMLElement>(
+            '.excerpt [data-search-entry]'
+          ) ?? [])
+        ]
+        if (marks.length > 0 || preferred || owners.length) {
+          const groups = owners.length
+            ? owners.flatMap((owner) => {
+                const ownMarks = marks.filter((mark) => owner.contains(mark))
+                return ownMarks.length ? groupMarks(ownMarks) : [[owner]]
+              })
+            : groupMarks(marks)
+          if (preferred && !groups.some((group) => group.includes(preferred)))
             groups.unshift([preferred])
           const current = groups.findIndex(
             (group) => preferred && group.includes(preferred)
@@ -1041,6 +1053,7 @@ export function useSearchModal() {
     },
     searching: 'Searching...',
     cycleMatches: 'to cycle matches',
+    sectionMatch: 'Matched through this section',
     detailedViewOn: 'Detailed view',
     detailedViewOff: 'Compact view'
   }
@@ -1111,9 +1124,9 @@ export function useSearchModal() {
 
     const mark = marks[curr][0]
     // Find the closest content container (same selectors used on the actual page)
-    const container = mark.closest(
-      match ? SEARCH_ENTRY_SELECTOR : 'li, p, td, dd, blockquote'
-    )
+    const container =
+      mark.closest('[data-search-entry]') ??
+      mark.closest(match ? SEARCH_ENTRY_SELECTOR : 'li, p, td, dd, blockquote')
     if (!container) return null
 
     return match
