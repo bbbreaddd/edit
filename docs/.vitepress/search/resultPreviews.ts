@@ -458,6 +458,7 @@ function filterQueryResults(
         if (
           !urlMatched &&
           ((result.entryMatch.withHeadingContext &&
+            !hasEntryFilters &&
             !result.terms.some((term) => ownTerms.has(term))) ||
             !result.matchesWithoutTerms?.(
               new Set(result.terms.filter((term) => !present.has(term))),
@@ -511,7 +512,10 @@ function filterQueryResults(
           entries.push({ context, phrases, rank })
       }
       if (!entries.length && !hasEntryFilters) {
-        for (const heading of result.entryMatch.headings ?? [result.title]) {
+        const headings = result.entryMatch.headings ?? [result.title]
+        for (const heading of result.entryMatch.withHeadingContext
+          ? [headings.join(' > ')]
+          : headings) {
           const text = normalizeExcerptText(heading.replace(/<[^>]*>/g, ' '))
           if (
             !phrasePatterns.every((pattern) => pattern.test(text)) ||
@@ -578,6 +582,14 @@ function filterQueryResults(
     if (!query || isPhrase) return true
     if (fuzzy) {
       if (!hasEntryFilters) return true
+      if (
+        result.entryMatch?.withHeadingContext &&
+        result.entryMatch.entries?.some(
+          (entry) =>
+            !entry.heading && normalizeExcerptText(entry.context) === text
+        )
+      )
+        return true
       const present = new Set(tokenizeIndexLike(indexedText, true))
       return !!result.matchesWithoutTerms?.(
         new Set(result.terms.filter((term) => !present.has(term))),

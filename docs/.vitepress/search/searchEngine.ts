@@ -87,6 +87,15 @@ function fuzzyTolerance(term: string) {
   return term.length < 9 ? 1 : 2
 }
 
+function headingWordStem(term: string) {
+  const stem = term.replace(/(?:ors?|ing|ions?)$/, '')
+  return stem.length >= 4 &&
+    stem !== term &&
+    (!/ions?$/.test(term) || stem.endsWith('at'))
+    ? stem
+    : undefined
+}
+
 function createTermLookup(terms: string[], metadata: SearchMetadata) {
   const indexedTerms = new Set(terms)
   const recognizedPrefixes = new Map<string, boolean>()
@@ -144,8 +153,19 @@ function createTermLookup(terms: string[], metadata: SearchMetadata) {
   const spellingRecoveries = new Map<string, string[]>()
   return {
     indexedTerms,
+    curatedTerms,
     recognizes,
     aliases,
+    headingForms(word: string) {
+      if (!/(?:ors?|ions?)$/.test(word)) return []
+      const stem = headingWordStem(word)
+      if (!stem) return []
+      const forms = [`${stem}or`, `${stem}ors`, `${stem}ing`]
+      if (stem.endsWith('at')) forms.push(`${stem}ion`, `${stem}ions`)
+      return forms.filter(
+        (term) => !term.startsWith(word) && indexedTerms.has(term)
+      )
+    },
     joinedAliases(words: string[]) {
       // Only unfamiliar splits receive a curated-name alternative.
       if (
@@ -382,6 +402,8 @@ function runSearch(
   let query: Query = filterTextValue
 
   const recoveredTerms = new Map<string, string[]>()
+  const headingAlternatives = new Set<string>()
+  const originalTerms = new Set(tokenizeIndexLike(filterTextValue))
   let joinedTerms: string[] = []
   const entryPhraseGroups: string[][] = []
   const canRecoverTerms = fuzzy && !looksLikeUrlQuery(filterTextValue)
@@ -408,9 +430,20 @@ function runSearch(
                   ? getTermLookup()
                   : undefined
               const alternatives = lookup?.alternatives(part) ?? []
+              const wordForms =
+                parts.length > 1 && !parsed.phrases.length
+                  ? (lookup?.headingForms(part.toLowerCase()) ?? [])
+                  : []
+              for (const term of wordForms)
+                if (!originalTerms.has(term)) headingAlternatives.add(term)
               const compounds = lookup?.compounds(part) ?? []
               if (compounds.length) entryPhraseGroups.push([part, ...compounds])
-              if (!alternatives.length && !compounds.length) return part
+              if (
+                !alternatives.length &&
+                !compounds.length &&
+                !wordForms.length
+              )
+                return part
               const queries: Query[] = [
                 { queries: [part], fuzzy: queryFuzzyTolerance }
               ]
@@ -430,6 +463,13 @@ function runSearch(
                     )
                 })
               }
+              if (wordForms.length)
+                queries.push({
+                  queries: wordForms,
+                  combineWith: 'OR',
+                  fuzzy: false,
+                  prefix: false
+                })
               for (const phrase of compounds)
                 queries.push({
                   queries: [phrase],
@@ -471,6 +511,11 @@ function runSearch(
     !isPhrase &&
     !looksLikeUrlQuery(filterTextValue) &&
     !(fuzzy && filterTextValue.length < 5 && /[#+]/.test(filterTextValue)) &&
+    !(
+      fuzzy &&
+      filterTextValue.length <= 3 &&
+      getTermLookup().curatedTerms.has(filterTextValue.toLowerCase())
+    ) &&
     (!/\s/.test(filterTextValue) || joinedTerms.length > 0) &&
     filterTextValue.length > 2
   ) {
@@ -558,6 +603,22 @@ function runSearch(
       )
     : []
   for (const result of rawResults) {
+    const bodyOnlyForms = result.terms.filter(
+      (term) =>
+        headingAlternatives.has(term) &&
+        result.match[term]?.every((field) => field === 'text')
+    )
+    if (
+      bodyOnlyForms.length &&
+      !matchesWithoutTerms?.(result, new Set(bodyOnlyForms), false)
+    )
+      continue
+    if (bodyOnlyForms.length) {
+      result.terms = result.terms.filter(
+        (term) => !bodyOnlyForms.includes(term)
+      )
+      for (const term of bodyOnlyForms) delete result.match[term]
+    }
     if (
       !programmingSuffixes.every((suffix) =>
         result.terms.some((term) => term.match(/[#+]+/)?.[0] === suffix)
@@ -696,6 +757,25 @@ function runSearch(
     pattern: createPhraseRegex(phrase),
     prefix: /\s/.test(phrase) ? phrase.toLowerCase() : ''
   }))
+  const headingStem =
+    fuzzy && singleTerms.length === 1
+      ? headingWordStem(singleTerms[0])
+      : undefined
+  const headingWords =
+    fuzzy && /\s/.test(q) && !isPhrase
+      ? tokenizeIndexLike(q).map((term) => headingWordStem(term) ?? term)
+      : []
+  const coversHeading = (titles: string[]) => {
+    if (headingWords.length < 2) return false
+    const keys = new Set<string>()
+    for (const title of titles) {
+      const words = tokenizeIndexLike(title.replace(/<[^>]*>/g, ' '))
+      for (const term of words) keys.add(headingWordStem(term) ?? term)
+      if (words.length > 1) keys.add(words.map((term) => term[0]).join(''))
+    }
+    return headingWords.every((word) => keys.has(word))
+  }
+  const headingStems = new Set([...headingAlternatives].map(headingWordStem))
   const boostedResults = currentResults.map((r) => {
     const meta = metadata[r.id]
     const auxiliaryLabels = new Set(meta?.a)
@@ -770,15 +850,47 @@ function runSearch(
 
     const indexedTitles =
       (index.getStoredFields(r.id) as Result | undefined)?.titles ?? []
-    const hasHeadingMatch =
-      // Sidebar labels are display context; use the indexed heading hierarchy.
-      [r.title, ...indexedTitles].some((title) =>
-        headingPatterns.some(
-          ({ pattern, prefix }) =>
-            pattern.test(title) ||
-            (!!prefix && title.toLowerCase().startsWith(prefix))
-        )
+    const matchesHeading = (title: string) =>
+      headingPatterns.some(
+        ({ pattern, prefix }) =>
+          pattern.test(title) ||
+          (!!prefix && title.toLowerCase().startsWith(prefix))
+      ) ||
+      (!!headingStem &&
+        tokenizeIndexLike(title).some(
+          (term) => headingWordStem(term) === headingStem
+        ))
+    const fullHeadingMatch = coversHeading([...r.titles, r.title])
+    const ownHeadingFormMatch =
+      fullHeadingMatch &&
+      tokenizeIndexLike(r.title).some((term) =>
+        headingStems.has(headingWordStem(term))
       )
+    const literalOwnHeadingMatch =
+      matchesHeading(r.title) ||
+      (ownHeadingFormMatch &&
+        tokenizeIndexLike(r.title).some((term) =>
+          [...originalTerms].some(
+            (word) => headingWordStem(word) && term.startsWith(word)
+          )
+        ))
+    const ownHeadingMatch =
+      matchesHeading(r.title) || coversHeading([r.title]) || ownHeadingFormMatch
+    const exactHeadingMatch =
+      headingPhrases.length > 0 &&
+      ((headingWords.length > 1 && r.title.toLowerCase() === q) ||
+        (!!headingStem &&
+          headingWordStem(r.title.toLowerCase()) === headingStem))
+    const headingMatchRank = exactHeadingMatch
+      ? 4
+      : literalOwnHeadingMatch
+        ? 3
+        : ownHeadingMatch
+          ? 2
+          : indexedTitles.some(matchesHeading) || fullHeadingMatch
+            ? 1
+            : 0
+    const hasHeadingMatch = headingMatchRank > 0
     const hasDirectWord =
       !!directMatches?.has(r.id) &&
       !(hasAuxiliaryWord && !hasStarredWord && !hasLinkWord && !hasHeadingMatch)
@@ -792,11 +904,12 @@ function runSearch(
           ? {
               groups: entryPhraseGroups,
               withHeadingContext,
-              // Language-specific subsections inherit their language heading.
-              headings:
-                withHeadingContext && !r.id.startsWith('/non-english#')
-                  ? [r.title]
-                  : [r.title, ...indexedTitles],
+              // Use the indexed hierarchy, excluding sidebar display labels.
+              headings: withHeadingContext
+                ? headingAlternatives.size || r.id.startsWith('/non-english#')
+                  ? [...indexedTitles, r.title]
+                  : [r.title]
+                : [r.title, ...indexedTitles],
               auxiliary: meta?.a ?? []
             }
           : undefined,
@@ -814,6 +927,8 @@ function runSearch(
       hasLinkWord,
       hasLinkUrl,
       hasHeadingMatch,
+      headingMatchRank,
+      headingDepth: indexedTitles.length,
       hasDirectWord,
       isRecentlyRemoved: /^\/recently-removed(?:\.html)?(?:#|$)/.test(r.id)
     }
@@ -846,8 +961,14 @@ function runSearch(
       Number(b.hasStarredUrl && b.urlMatchRank === 3) -
       Number(a.hasStarredUrl && a.urlMatchRank === 3)
     if (exactStarredUrlDifference) return exactStarredUrlDifference
-    if (a.hasHeadingMatch !== b.hasHeadingMatch)
-      return a.hasHeadingMatch ? -1 : 1
+    if (a.headingMatchRank !== b.headingMatchRank)
+      return b.headingMatchRank - a.headingMatchRank
+    if (
+      headingWords.length > 1 &&
+      a.headingMatchRank > 0 &&
+      a.headingDepth !== b.headingDepth
+    )
+      return a.headingDepth - b.headingDepth
     for (const key of tierKeys) {
       const av = a[key] ? 1 : 0
       const bv = b[key] ? 1 : 0
