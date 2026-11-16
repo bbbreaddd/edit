@@ -1,6 +1,6 @@
 import type { DefaultTheme } from 'vitepress'
 import type { ModalTranslations } from 'vitepress/types/local-search'
-import type { LocalSearchResult, SearchMetadata, SidebarItem } from './types'
+import type { LocalSearchResult, SidebarItem } from './types'
 import localSearchIndex from '@localSearchIndex'
 import {
   computedAsync,
@@ -40,11 +40,13 @@ import {
 import { INVISIBLE_CHARS_RE, parseSearchQuery } from './normalization'
 import { createSearchNavigation } from './resultNavigation'
 import {
+  createEntrySearch,
   excerptCache,
   filterResults,
+  filterSearchExclusions,
   loadExcerpts,
   lookupExcerptText,
-  refineSearchEntries
+  usesEntrySearch
 } from './resultPreviews'
 import { createSearchEngine, loadSearchIndex } from './searchEngine'
 import { isExplicitUrlQuery, looksLikeUrlQuery } from './urlMatching'
@@ -66,7 +68,7 @@ type SearchSnapshot = {
   source: typeof searchIndexSource.value
   locale: string
   options: DefaultTheme.LocalSearchOptions['miniSearch']
-  metadata: SearchMetadata
+  entryEngine: ReturnType<typeof createEntrySearch>
   engine: ReturnType<typeof createSearchEngine>
 }
 
@@ -227,17 +229,22 @@ export function useSearchModal() {
       options?.searchOptions
     )
     if (!loaded) return null
-    const snapshot = markRaw({
-      source,
-      locale,
-      options,
-      metadata: loaded.metadata,
-      engine: createSearchEngine(
-        loaded.index,
-        loaded.metadata,
-        Array.isArray(sidebar) ? sidebar : []
-      )
-    })
+    const searchSidebar = Array.isArray(sidebar) ? sidebar : []
+    const engine = createSearchEngine(
+      loaded.index,
+      loaded.metadata,
+      searchSidebar
+    )
+    const entryEngine = createEntrySearch(
+      engine.sections().map((section) => ({
+        ...section,
+        text: loaded.sectionHtml[section.id] ?? ''
+      })),
+      loaded.metadata,
+      searchSidebar,
+      engine
+    )
+    const snapshot = markRaw({ source, locale, options, engine, entryEngine })
     if (
       source === searchIndexSource.value &&
       locale === localeIndex.value &&
@@ -435,13 +442,13 @@ export function useSearchModal() {
         return
       }
 
-      const { results: boostedResults } = snapshot.engine.search(
-        filterTextValue,
-        {
-          fuzzy: isFuzzySearch.value,
-          urls: isUrlSearch.value
-        }
-      )
+      const queryEngine = usesEntrySearch(filterTextValue, isFuzzySearch.value)
+        ? snapshot.entryEngine
+        : snapshot.engine
+      const { results: boostedResults } = queryEngine.search(filterTextValue, {
+        fuzzy: isFuzzySearch.value,
+        urls: isUrlSearch.value
+      })
 
       enableNoResults.value = true
 
@@ -533,45 +540,43 @@ export function useSearchModal() {
       const literalQuery = searchQuery.text
         .replace(INVISIBLE_CHARS_RE, '')
         .toLowerCase()
-      const useEntrySearch =
-        fuzzy &&
-        !searchQuery.phrases.length &&
-        !searchQuery.branches.length &&
-        !!searchQuery.text &&
-        !looksLikeUrlQuery(searchQuery.text)
+      const useEntrySearch = usesEntrySearch(query, fuzzy)
       const needsContentFiltering =
-        useEntrySearch ||
-        hasExclusions ||
-        allRes.some(
-          (result) =>
-            !!result.entryMatch?.groups.length ||
-            result.entryMatch?.withHeadingContext
-        ) ||
-        searchQuery.sites.length > 0 ||
-        searchQuery.urls.length > 0 ||
-        searchQuery.phrases.length > 0 ||
-        (!fuzzy &&
-          (/\s/.test(searchQuery.text) ||
-            allRes.some(
-              (result) =>
-                !result.substringMatched &&
-                !result.urlMatched &&
-                !result.terms.some((term) => term.includes(literalQuery))
-            )))
+        !useEntrySearch &&
+        (hasExclusions ||
+          allRes.some(
+            (result) =>
+              !!result.entryMatch?.groups.length ||
+              result.entryMatch?.withHeadingContext
+          ) ||
+          searchQuery.sites.length > 0 ||
+          searchQuery.urls.length > 0 ||
+          searchQuery.phrases.length > 0 ||
+          (!fuzzy &&
+            (/\s/.test(searchQuery.text) ||
+              allRes.some(
+                (result) =>
+                  !result.substringMatched &&
+                  !result.urlMatched &&
+                  !result.terms.some((term) => term.includes(literalQuery))
+              ))))
       // Qualify the bounded engine result set before pagination or category counts.
-      const candidates = needsContentFiltering ? allRes : sliced
+      const candidates =
+        useEntrySearch || needsContentFiltering ? allRes : sliced
       const needsPreviewFiltering =
-        needsContentFiltering ||
-        candidates.some((result) => !!result.entryMatch)
+        !useEntrySearch &&
+        (needsContentFiltering ||
+          candidates.some((result) => !!result.entryMatch))
       const includeExcerpts = needsPreviewFiltering || showDetailedListValue
       const knownMatches = new Set(
-        filterResults(candidates, query, false, fuzzy).map(
-          (result) => result.id
-        )
+        needsPreviewFiltering
+          ? filterResults(candidates, query, false, fuzzy).map(
+              (result) => result.id
+            )
+          : []
       )
       const previewCandidates = candidates.filter(
         (result, index) =>
-          useEntrySearch ||
           (needsPreviewFiltering && !knownMatches.has(result.id)) ||
           (showDetailedListValue && index < limit)
       )
@@ -582,40 +587,35 @@ export function useSearchModal() {
         ...result,
         text: includeExcerpts ? lookupExcerptText(result.id) : ''
       }))
-      const filtered =
-        useEntrySearch && snapshot
-          ? refineSearchEntries(
-              mapped,
-              query,
-              { fuzzy, urls },
-              snapshot.metadata,
-              Array.isArray(sidebar) ? sidebar : [],
-              snapshot.engine.headingForms
-            )
-          : needsPreviewFiltering
-            ? filterResults(mapped, query, true, fuzzy)
-            : mapped
+      const filtered = useEntrySearch
+        ? mapped
+        : needsPreviewFiltering
+          ? filterResults(mapped, query, true, fuzzy)
+          : mapped
       const scopedMatches = category
         ? filtered.filter((result) => resultCategoryOf(result.id) === category)
         : filtered
-      const finalResults = scopedMatches.slice(0, limit)
+      let finalResults = scopedMatches.slice(0, limit)
       if (showDetailedListValue) {
         await loadExcerpts(finalResults, vitePressData, isCanceled)
         if (isCanceled()) return
-        if (!hasExclusions) {
+        if (useEntrySearch || !hasExclusions) {
           for (const result of finalResults)
             result.text = lookupExcerptText(result.id)
+          if (hasExclusions)
+            finalResults = filterSearchExclusions(finalResults, query)
         }
       }
-      const totalCount = needsContentFiltering
-        ? scopedMatches.length
-        : mapped.length + Math.max(0, scopedResults.length - limit)
+      const totalCount =
+        useEntrySearch || needsContentFiltering
+          ? scopedMatches.length
+          : mapped.length + Math.max(0, scopedResults.length - limit)
       const mayHaveMoreValue = false
 
       if (resultSetChanged) {
         // A category's preview filtering must not remove the other category chips.
         categoryCounts.value = computeCategoryCounts(
-          needsContentFiltering ? filtered : allRes
+          useEntrySearch || needsContentFiltering ? filtered : allRes
         )
       }
 

@@ -25,7 +25,7 @@ import {
   looksLikeUrlQuery
 } from './urlMatching'
 
-const MAX_RESULTS_IN_MEMORY = 200
+export const MAX_RESULTS_IN_MEMORY = 200
 const MAX_SUBSTRING_TERMS = 100
 const MAX_SUGGESTIONS = 3
 
@@ -54,6 +54,30 @@ function findPageTitle(items: SidebarItem[], path: string): string | null {
     }
   }
   return null
+}
+
+function addSectionContext(
+  result: LocalSearchResult,
+  sidebar: SidebarItem[],
+  order: number
+): LocalSearchResult {
+  const page =
+    '/' +
+    result.id
+      .split('#')[0]
+      .replace(/\.html$/, '')
+      .replace(/^\//, '')
+  const pageTitle = findPageTitle(sidebar, page) ?? ''
+  const titles = [...result.titles]
+  if (pageTitle && !titles.includes(pageTitle) && result.title !== pageTitle)
+    titles.unshift(pageTitle)
+  return {
+    ...result,
+    titles,
+    indexedTitles: [...result.titles],
+    pageTitle,
+    sectionOrder: order
+  }
 }
 
 function collectLinkTerms(customMetadata: SearchMetadata) {
@@ -663,24 +687,9 @@ function runSearch(
   const sidebarItems = Array.isArray(sidebar) ? sidebar : []
   const currentResults: LocalSearchResult[] = [...mergedResultsById.values()]
     .filter((result) => !siteMatches || siteMatches.has(result.id))
-    .map((r) => {
-      const [id] = r.id.split('#')
-      const cleanPath = '/' + id.replace(/\.html$/, '').replace(/^\//, '')
-      const pageTitle = findPageTitle(sidebarItems, cleanPath)
-      const titles = [...r.titles]
-
-      if (pageTitle && !titles.includes(pageTitle) && r.title !== pageTitle) {
-        titles.unshift(pageTitle)
-      }
-
-      return {
-        ...r,
-        titles,
-        indexedTitles: [...r.titles],
-        pageTitle: pageTitle ?? '',
-        sectionOrder: sectionOrder.get(r.id) ?? 0
-      }
-    })
+    .map((result) =>
+      addSectionContext(result, sidebarItems, sectionOrder.get(result.id) ?? 0)
+    )
     .filter(
       (result) =>
         titlePatterns.every((pattern) =>
@@ -1210,11 +1219,19 @@ function suggestSearch(
 }
 
 export function loadSearchIndex(
-  rawIndex: string | (AsPlainObject & { customMetadata?: SearchMetadata }),
+  rawIndex:
+    | string
+    | (AsPlainObject & {
+        customMetadata?: SearchMetadata
+        sectionHtml?: Record<string, string>
+      }),
   options?: Partial<Options<Result>>,
   searchOptions?: SearchOptions
 ) {
-  let parsed: AsPlainObject & { customMetadata?: SearchMetadata }
+  let parsed: AsPlainObject & {
+    customMetadata?: SearchMetadata
+    sectionHtml?: Record<string, string>
+  }
   try {
     parsed = typeof rawIndex === 'string' ? JSON.parse(rawIndex) : rawIndex
   } catch {
@@ -1222,6 +1239,7 @@ export function loadSearchIndex(
   }
   return {
     metadata: parsed?.customMetadata || {},
+    sectionHtml: parsed.sectionHtml ?? {},
     index: MiniSearch.loadJS<Result>(parsed, {
       fields: ['title', 'titles', 'text'],
       storeFields: ['title', 'titles'],
@@ -1258,6 +1276,17 @@ export function createSearchEngine(
   let termLookup: ReturnType<typeof createTermLookup> | undefined
   const getTermLookup = () => (termLookup ??= createTermLookup(terms, metadata))
   return {
+    sections() {
+      return index
+        .search(MiniSearch.wildcard, { boostDocument: undefined })
+        .map((result) =>
+          addSectionContext(
+            result as LocalSearchResult,
+            sidebar,
+            sectionOrder.get(result.id as string) ?? 0
+          )
+        )
+    },
     headingForms(word: string) {
       return getTermLookup().headingForms(word)
     },

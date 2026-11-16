@@ -251,7 +251,7 @@ export function transform(text: string): string {
   return _text
 }
 
-const transformLinks = (text: string): string =>
+export const transformLinks = (text: string): string =>
   transformer(text)
     .transform('Links to Icons', [
       {

@@ -19,7 +19,7 @@ import type { SearchMetadata } from './types'
 import path from 'node:path'
 import MiniSearch from 'minisearch'
 import { excluded } from '../shared'
-import { transform, transformGuide } from '../transformer'
+import { transform, transformGuide, transformLinks } from '../transformer'
 import {
   INVISIBLE_CHARS_RE,
   normalizeSearchUrl,
@@ -54,12 +54,13 @@ const URL_SHORTENER_HOSTS = new Set([
 // a = auxiliary link labels after a resource description.
 // Bold-without-star is just an index label, no special ranking – folded into l.
 const globalLinkMetadata: SearchMetadata = {}
+const globalSectionHtml: Record<string, string> = {}
+const entryPageHtml = new Map<string, string>()
 
 // Inject customMetadata into the serialized MiniSearch index so the client
 // can read it back via MiniSearch.loadJS.  This patches the prototype because
 // VitePress controls serialization internally — there's no cleaner hook.
-// If MiniSearch ever drops toJSON, the build will still work; the metadata
-// just won't be attached (and the client already falls back to {}).
+// Upgrade-sensitive: the client needs both metadata and entry content here.
 let developmentIndexes: Set<MiniSearch> | undefined
 
 const originalToJSON = MiniSearch.prototype.toJSON
@@ -69,6 +70,7 @@ if (typeof originalToJSON === 'function') {
     const json = originalToJSON.call(this)
     if (json && typeof json === 'object') {
       ;(json as Record<string, unknown>).customMetadata = globalLinkMetadata
+      ;(json as Record<string, unknown>).sectionHtml = globalSectionHtml
     }
     return json
   }
@@ -319,6 +321,26 @@ export const search: DefaultTheme.Config['search'] = {
         contents = transform(contents)
       }
       let html = md.render(contents, env)
+      const file = relativePath.split('/').at(-1)
+      // Entry text must match page previews, including platform and auxiliary icons.
+      const entryHtml =
+        !isPostOrOther &&
+        file !== 'storage.md' &&
+        file !== 'recently-removed.md'
+          ? md.render(transformLinks(contents), { ...env })
+          : html
+      entryPageHtml.set(
+        getDocId(env.path),
+        stripNoteBlocks(
+          entryHtml
+            .replace(/<Tooltip[\s\S]*?<\/Tooltip>/gi, '')
+            // HTML treats self-closing Vue spans/divs as unclosed tags.
+            .replace(
+              /<(span|div)\b((?:[^>"']|"[^"]*"|'[^']*')*)\/>/gi,
+              '<$1$2></$1>'
+            )
+        )
+      )
       // Strip <Tooltip ...>...</Tooltip> contents to avoid indexing hidden notes in search
       html = html.replace(/<Tooltip[\s\S]*?<\/Tooltip>/gi, '')
       // Strip note/infobox custom blocks (:::tip/:::info/:::warning/:::danger,
@@ -342,6 +364,10 @@ export const search: DefaultTheme.Config['search'] = {
             delete globalLinkMetadata[key]
           }
         }
+        for (const key of Object.keys(globalSectionHtml)) {
+          if (key === fileId || key.startsWith(filePrefix))
+            delete globalSectionHtml[key]
+        }
         const sections: { anchor: string; titles: string[]; text: string }[] =
           []
 
@@ -356,7 +382,12 @@ export const search: DefaultTheme.Config['search'] = {
         const getSearchableText = (content: string) => clearHtmlTags(content)
 
         const result = html.split(headingRegex)
+        const entryContent = (entryPageHtml.get(fileId) ?? html).split(
+          headingRegex
+        )
+        entryPageHtml.delete(fileId)
         result.shift()
+        entryContent.shift()
         let parentTitles: string[] = []
 
         for (let i = 0; i < result.length; i += 3) {
@@ -373,6 +404,7 @@ export const search: DefaultTheme.Config['search'] = {
 
           const sectionId = anchor ? `${fileId}#${anchor}` : fileId
 
+          globalSectionHtml[sectionId] = entryContent[i + 2] ?? content
           const { links, starredBoldLinks, urls, starredUrls, auxiliaryLinks } =
             extractLinkMetadata(content)
           if (
